@@ -79,6 +79,7 @@ from ultralytics.utils.loss import (
     v8PoseLoss,
     v8SegmentationLoss,
 )
+from ultralytics.utils.dental_loss import DentalSegmentationLoss
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
 from ultralytics.utils.plotting import feature_visualization
@@ -544,7 +545,20 @@ class SegmentationModel(DetectionModel):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
-        """Initialize the loss criterion for the SegmentationModel."""
+        """Initialize the loss criterion for the SegmentationModel.
+
+        Returns v8SegmentationLoss by default, or DentalSegmentationLoss if dental-specific
+        hyperparameters (anatomy > 0 or hd95 > 0) are enabled.
+        """
+        # Check if dental-specific losses are enabled
+        use_dental = False
+        if hasattr(self, "args"):
+            anatomy_weight = getattr(self.args, "anatomy", 0.0)
+            hd95_weight = getattr(self.args, "hd95", 0.0)
+            use_dental = anatomy_weight > 0 or hd95_weight > 0
+
+        if use_dental:
+            return DentalSegmentationLoss(self)
         return v8SegmentationLoss(self)
 
 

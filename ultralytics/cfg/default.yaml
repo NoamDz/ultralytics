@@ -103,6 +103,8 @@ cls: 0.5 # (float) classification loss gain
 dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
+anatomy: 0.0 # (float) anatomical constraint loss gain (dental segment tasks); 0.5 suggested when enabled
+hd95: 0.0 # (float) HD95 boundary loss gain (dental segment tasks); 0.3 suggested when enabled
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction
