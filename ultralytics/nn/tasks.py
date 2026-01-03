@@ -548,14 +548,14 @@ class SegmentationModel(DetectionModel):
         """Initialize the loss criterion for the SegmentationModel.
 
         Returns v8SegmentationLoss by default, or DentalSegmentationLoss if dental-specific
-        hyperparameters (anatomy > 0 or hd95 > 0) are enabled.
+        hyperparameters (anatomy > 0 or gsl > 0) are enabled.
         """
         # Check if dental-specific losses are enabled
         use_dental = False
         if hasattr(self, "args"):
             anatomy_weight = getattr(self.args, "anatomy", 0.0)
-            hd95_weight = getattr(self.args, "hd95", 0.0)
-            use_dental = anatomy_weight > 0 or hd95_weight > 0
+            gsl_weight = getattr(self.args, "gsl", 0.0)
+            use_dental = anatomy_weight > 0 or gsl_weight > 0
 
         if use_dental:
             return DentalSegmentationLoss(self)

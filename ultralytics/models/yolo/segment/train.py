@@ -39,6 +39,17 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
         overrides["task"] = "segment"
         super().__init__(cfg, overrides, _callbacks)
 
+        # Add callback for dental loss epoch scheduling
+        self.add_callback("on_train_epoch_start", self._update_dental_loss_epoch)
+
+    def _update_dental_loss_epoch(self, trainer):
+        """Update dental loss criterion with current epoch for alpha scheduling."""
+        from ultralytics.utils.torch_utils import de_parallel
+
+        model = de_parallel(trainer.model)
+        if hasattr(model, "criterion") and hasattr(model.criterion, "set_epoch"):
+            model.criterion.set_epoch(trainer.epoch)
+
     def get_model(self, cfg: dict | str | None = None, weights: str | Path | None = None, verbose: bool = True):
         """Initialize and return a SegmentationModel with specified configuration and weights.
 
@@ -64,9 +75,9 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
         # Check if dental-specific losses are enabled
-        use_dental = getattr(self.args, "anatomy", 0.0) > 0 or getattr(self.args, "hd95", 0.0) > 0
+        use_dental = getattr(self.args, "anatomy", 0.0) > 0 or getattr(self.args, "gsl", 0.0) > 0
         if use_dental:
-            self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "anatomy_loss", "hd95_loss"
+            self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "anatomy_loss", "gsl_loss"
         else:
             self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss"
         return yolo.segment.SegmentationValidator(

@@ -104,7 +104,9 @@ dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 anatomy: 0.0 # (float) anatomical constraint loss gain (dental segment tasks); 0.5 suggested when enabled
-hd95: 0.0 # (float) HD95 boundary loss gain (dental segment tasks); 0.3 suggested when enabled
+gsl: 0.0 # (float) Generalized Surface Loss gain (dental segment tasks); 1.0 suggested when enabled
+dtm_iterations: 30 # (int) max iterations for Distance Transform Map computation in GSL
+gsl_weights_path: # (str, optional) path to pre-computed GSL class weights file (.pt)
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction
