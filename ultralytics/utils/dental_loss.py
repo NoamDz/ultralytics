@@ -5,284 +5,181 @@ Dental-specific loss functions for YOLOv11-seg tooth detection and segmentation.
 
 This module provides specialized losses for dental imaging:
 1. Anatomical Constraint Loss - Penalizes anatomically implausible tooth detections
-2. Generalized Surface Loss (GSL) - Boundary-focused loss from arXiv:2302.03868
+2. Boundary Loss - Contour-based loss for improved boundary delineation
 
 Supports FDI tooth numbering system with 32 classes (panoramic) or 24 classes (bitewing).
 
 References:
-    Celaya et al., "A Generalized Surface Loss for Reducing the Hausdorff Distance
-    in Medical Imaging Segmentation", arXiv:2302.03868, 2024.
+    Kervadec et al., "Boundary loss for highly unbalanced segmentation",
+    Medical Image Analysis, 2021. https://github.com/LIVIAETS/surface-loss
 """
 
 from __future__ import annotations
 
+import os
+import time
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.utils import LOGGER
 from ultralytics.utils.loss import v8SegmentationLoss
 
 
-class DistanceTransform(nn.Module):
+def compute_signed_distance_map_batch(masks: np.ndarray) -> np.ndarray:
     """
-    GPU-native Distance Transform Map (DTM) computation using morphological operations.
+    Compute signed distance maps for a batch of binary masks using scipy EDT.
 
-    Computes signed distance transform where:
-    - Positive values = exterior (outside mask)
-    - Zero = boundary
-    - Negative values = interior (inside mask)
+    This is the core distance computation from the boundary loss paper.
+    Uses scipy's distance_transform_edt which is highly optimized.
 
-    This is an iterative approximation that converges to true Euclidean distance.
+    Args:
+        masks (np.ndarray): Binary masks, shape (N, H, W), values in {0, 1}.
+
+    Returns:
+        np.ndarray: Signed distance maps, shape (N, H, W).
+            - Positive values: outside the mask (background)
+            - Negative values: inside the mask (foreground)
+            - Zero: on the boundary
     """
+    from scipy.ndimage import distance_transform_edt
 
-    def __init__(self, max_iterations: int = 30):
-        """
-        Initialize DistanceTransform.
+    batch_size = masks.shape[0]
+    dist_maps = np.zeros_like(masks, dtype=np.float32)
 
-        Args:
-            max_iterations (int): Maximum iterations for distance computation.
-                Higher = more accurate for large objects, but slower.
-        """
-        super().__init__()
-        self.max_iterations = max_iterations
+    for i in range(batch_size):
+        mask = masks[i]
 
-        # 3x3 kernel for morphological operations (8-connectivity)
-        kernel = torch.ones(1, 1, 3, 3)
-        self.register_buffer("kernel", kernel)
+        # Skip empty masks - return zero distance map
+        if mask.sum() == 0:
+            continue
 
-    def forward(self, masks: torch.Tensor) -> torch.Tensor:
-        """
-        Compute signed distance transform for batch of masks.
+        # Skip full masks - return zero distance map
+        if mask.sum() == mask.size:
+            continue
 
-        Args:
-            masks (torch.Tensor): Binary masks, shape (N, H, W) or (N, 1, H, W).
+        # Compute distance from exterior points to boundary (positive outside)
+        # EDT of inverted mask gives distance to nearest foreground pixel
+        exterior_dist = distance_transform_edt(1 - mask)
 
-        Returns:
-            (torch.Tensor): Signed DTM, same shape as input.
-                Positive outside, zero on boundary, negative inside.
-        """
-        # Ensure 4D: (N, 1, H, W)
-        if masks.dim() == 3:
-            masks = masks.unsqueeze(1)
-        elif masks.dim() == 2:
-            masks = masks.unsqueeze(0).unsqueeze(0)
+        # Compute distance from interior points to boundary (negative inside)
+        # EDT of mask gives distance to nearest background pixel
+        interior_dist = distance_transform_edt(mask)
 
-        masks = masks.float()
+        # Combine: positive outside, negative inside
+        # φ_G(q) = D_G(q) if q outside G, -D_G(q) if q inside G
+        dist_maps[i] = exterior_dist - interior_dist
 
-        # Compute interior distance (negative inside)
-        interior_dist = self._compute_interior_distance(masks)
-
-        # Compute exterior distance (positive outside)
-        exterior_dist = self._compute_exterior_distance(masks)
-
-        # Combine: negative inside, positive outside, zero on boundary
-        dtm = exterior_dist - interior_dist
-
-        # Remove channel dimension if input was 3D
-        return dtm.squeeze(1)
-
-    def _compute_interior_distance(self, masks: torch.Tensor) -> torch.Tensor:
-        """
-        Compute distance from interior points to boundary (erosion-based).
-
-        No early exit to avoid GPU synchronization. Operations on zero tensors are fast.
-        """
-        distance = torch.zeros_like(masks)
-        current = masks.clone()
-
-        for i in range(1, self.max_iterations + 1):
-            # Erosion: min pooling (or equivalently, -max(-x))
-            eroded = -F.max_pool2d(-current, 3, stride=1, padding=1)
-
-            # Pixels that were removed in this iteration are at distance i
-            removed = current - eroded
-            distance = distance + removed * i
-
-            # Update for next iteration
-            current = eroded
-
-        return distance
-
-    def _compute_exterior_distance(self, masks: torch.Tensor) -> torch.Tensor:
-        """
-        Compute distance from exterior points to boundary (dilation-based).
-
-        No early exit to avoid GPU synchronization. Operations on zero tensors are fast.
-        """
-        distance = torch.zeros_like(masks)
-        current = masks.clone()
-        exterior_mask = 1.0 - masks  # Points outside the mask
-
-        for i in range(1, self.max_iterations + 1):
-            # Dilation: max pooling
-            dilated = F.max_pool2d(current, 3, stride=1, padding=1)
-
-            # Pixels that were added in this iteration (and are in exterior)
-            added = (dilated - current) * exterior_mask
-            distance = distance + added * i
-
-            # Update exterior mask (remove newly covered areas)
-            exterior_mask = exterior_mask - added
-
-            # Update for next iteration
-            current = dilated
-
-        return distance
+    return dist_maps
 
 
-class GeneralizedSurfaceLoss(nn.Module):
+class BoundaryLoss(nn.Module):
     """
-    Generalized Surface Loss (GSL) for boundary-focused segmentation.
+    Boundary Loss for segmentation from Kervadec et al. (2021).
 
-    From: "A Generalized Surface Loss for Reducing the Hausdorff Distance
-    in Medical Imaging Segmentation" (arXiv:2302.03868)
+    This loss operates on contours rather than regions, making it effective
+    for highly unbalanced segmentation problems. It uses a signed distance
+    function to weight predictions based on their distance from the boundary.
 
-    Formula (Equation 12):
-        L_gsl = 1 - (Σ w_k Σ (D_i * (1 - (T_i + P_i)))²) / (Σ w_k Σ (D_i)²)
+    Formula (Equation 5 from paper):
+        L_B(θ) = Σ_q φ_G(q) * s_θ(q)
+
+    Where:
+        - φ_G(q) = -D_G(q) if q ∈ G (inside ground truth - negative)
+        - φ_G(q) = +D_G(q) if q ∉ G (outside ground truth - positive)
+        - s_θ(q) is the softmax/sigmoid probability output
 
     Key properties:
-    - Bounded in [0, 1] - won't dominate region-based loss
-    - Only requires DTM from ground truth (not predictions)
-    - Pre-computed class weights for class imbalance
+        - Perfect prediction minimizes loss (sums only negative values)
+        - False positives add positive φ_G → increases loss
+        - False negatives miss negative φ_G → increases loss
+        - Pixels far from boundary have larger |φ_G| → stronger penalty
 
-    Attributes:
-        dtm_transform (DistanceTransform): Module for computing DTMs.
-        class_weights (torch.Tensor | None): Pre-computed class weights.
+    IMPORTANT: Cannot be used alone - requires combination with regional loss.
     """
 
-    def __init__(
-        self,
-        max_dtm_iterations: int = 30,
-        class_weights: torch.Tensor | None = None,
-    ):
-        """
-        Initialize GeneralizedSurfaceLoss.
-
-        Args:
-            max_dtm_iterations (int): Max iterations for DTM computation.
-            class_weights (torch.Tensor, optional): Pre-computed class weights.
-                Shape (num_classes,). If None, uniform weights are used.
-        """
+    def __init__(self):
+        """Initialize BoundaryLoss."""
         super().__init__()
-        self.dtm_transform = DistanceTransform(max_iterations=max_dtm_iterations)
-
-        if class_weights is not None:
-            self.register_buffer("class_weights", class_weights)
-        else:
-            self.class_weights = None
 
     def forward(
         self,
         pred_masks: torch.Tensor,
         gt_masks: torch.Tensor,
-        class_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Compute GSL loss for batch of mask pairs.
+        Compute boundary loss for batch of mask pairs.
 
         Args:
             pred_masks (torch.Tensor): Predicted masks after sigmoid, shape (N, H, W).
+                Values should be in [0, 1].
             gt_masks (torch.Tensor): Ground truth binary masks, shape (N, H, W).
-            class_indices (torch.Tensor, optional): Class index for each mask, shape (N,).
-                Used for class-weighted loss. If None, uniform weights.
+                Values should be in {0, 1}.
 
         Returns:
-            (torch.Tensor): Scalar GSL loss in [0, 1].
+            torch.Tensor: Scalar boundary loss value.
         """
         if pred_masks.numel() == 0:
             return torch.tensor(0.0, device=pred_masks.device)
 
-        # Compute DTM for ground truth masks (NOT predictions - key efficiency)
-        dtm = self.dtm_transform(gt_masks)
+        # Compute signed distance maps from ground truth (on CPU using scipy)
+        # This is very fast and doesn't require GPU synchronization
+        gt_np = gt_masks.detach().cpu().numpy().astype(np.float32)
+        dist_maps_np = compute_signed_distance_map_batch(gt_np)
 
-        # Ensure same shape
-        if dtm.shape != pred_masks.shape:
-            dtm = dtm.view_as(pred_masks)
+        # Transfer back to GPU
+        dist_maps = torch.from_numpy(dist_maps_np).to(
+            device=pred_masks.device, dtype=pred_masks.dtype
+        )
 
-        # GSL formula: D * (1 - (T + P))
-        # When P matches T: (1 - (T + P)) = (1 - 2T) = -1 inside, +1 outside
-        # Multiplied by D: recovers |D| for perfect prediction
-        term = dtm * (1.0 - (gt_masks + pred_masks))
+        # Boundary loss: L_B = mean(φ_G * pred)
+        # Element-wise product and mean
+        boundary_loss = (dist_maps * pred_masks).mean()
 
-        # Squared term (numerator component)
-        term_squared = term ** 2
-
-        # Denominator: sum of D²
-        dtm_squared = dtm ** 2
-
-        # Apply class weights if provided
-        if self.class_weights is not None and class_indices is not None:
-            weights = self.class_weights[class_indices]  # (N,)
-            weights = weights.view(-1, 1, 1)  # (N, 1, 1) for broadcasting
-
-            numerator = (weights * term_squared.view(term_squared.shape[0], -1).sum(dim=1, keepdim=True)).sum()
-            denominator = (weights * dtm_squared.view(dtm_squared.shape[0], -1).sum(dim=1, keepdim=True)).sum()
-        else:
-            # Uniform weights - simple sum
-            numerator = term_squared.sum()
-            denominator = dtm_squared.sum()
-
-        # GSL = 1 - numerator/denominator
-        # Add epsilon to avoid division by zero
-        gsl = 1.0 - numerator / (denominator + 1e-8)
-
-        return gsl
-
-    @staticmethod
-    def compute_class_weights(class_pixel_counts: dict[int, int]) -> torch.Tensor:
-        """
-        Compute class weights from dataset statistics (Equation 13 from paper).
-
-        Formula: w_k = (1 / Σ(1/N_j)) * (1/N_k)
-
-        Args:
-            class_pixel_counts (dict): Mapping of class_index -> total_pixel_count.
-                Example: {0: 50000, 1: 30000, 2: 5000, ...}
-
-        Returns:
-            (torch.Tensor): Class weights, shape (num_classes,).
-
-        Example:
-            >>> counts = {0: 50000, 1: 30000, 2: 5000}  # Class 2 is rare
-            >>> weights = GeneralizedSurfaceLoss.compute_class_weights(counts)
-            >>> # weights[2] will be highest (rare class gets more weight)
-        """
-        num_classes = max(class_pixel_counts.keys()) + 1
-        weights = torch.zeros(num_classes)
-
-        # Compute sum of inverses
-        inverse_sum = sum(1.0 / count for count in class_pixel_counts.values() if count > 0)
-
-        # Compute normalized weights
-        for class_idx, count in class_pixel_counts.items():
-            if count > 0:
-                weights[class_idx] = (1.0 / inverse_sum) * (1.0 / count)
-
-        return weights
+        return boundary_loss
 
 
 class AlphaScheduler:
     """
     Alpha scheduler for combining region-based and boundary-based losses.
 
-    Combined loss: L = α * L_region + (1 - α) * L_boundary
+    From the paper, the "rebalance" strategy is recommended:
+        Combined loss: (1 - α) * L_regional + α * L_boundary
 
-    Alpha starts at 1.0 (pure region loss) and decays to 0.0 (pure boundary loss).
+    Alpha starts small and increases over epochs, allowing regional loss
+    to guide early training while boundary loss refines boundaries later.
+
+    Strategies:
+        - "rebalance": α starts at alpha_start, increases by alpha_increment each epoch
+        - "linear": α = epoch / total_epochs
+        - "constant": α stays fixed at alpha_start
     """
 
-    def __init__(self, total_epochs: int, schedule: str = "linear", step_size: int = 5):
+    def __init__(
+        self,
+        total_epochs: int,
+        schedule: str = "rebalance",
+        alpha_start: float = 0.01,
+        alpha_increment: float = 0.01,
+        alpha_max: float = 1.0,
+    ):
         """
         Initialize AlphaScheduler.
 
         Args:
             total_epochs (int): Total training epochs.
-            schedule (str): Schedule type - "linear", "step", or "cosine".
-            step_size (int): Step size for "step" schedule.
+            schedule (str): Schedule type - "rebalance", "linear", or "constant".
+            alpha_start (float): Starting alpha value (for rebalance/constant).
+            alpha_increment (float): Alpha increase per epoch (for rebalance).
+            alpha_max (float): Maximum alpha value (cap).
         """
         self.total_epochs = total_epochs
         self.schedule = schedule
-        self.step_size = step_size
-        self.n_steps = total_epochs // step_size if step_size > 0 else total_epochs
+        self.alpha_start = alpha_start
+        self.alpha_increment = alpha_increment
+        self.alpha_max = alpha_max
 
     def get_alpha(self, epoch: int) -> float:
         """
@@ -292,48 +189,46 @@ class AlphaScheduler:
             epoch (int): Current epoch (0-indexed).
 
         Returns:
-            (float): Alpha value in [0, 1].
+            float: Alpha value in [0, alpha_max].
         """
-        t = min(epoch, self.total_epochs - 1)
-        T = self.total_epochs
+        if self.schedule == "rebalance":
+            # Paper's recommended strategy: start small, increase linearly
+            alpha = self.alpha_start + epoch * self.alpha_increment
+            return min(alpha, self.alpha_max)
 
-        if self.schedule == "linear":
-            # Equation 14: α = 1 - t/T
-            return 1.0 - t / T
+        elif self.schedule == "linear":
+            # Linear from 0 to 1
+            if self.total_epochs <= 1:
+                return self.alpha_max
+            return min(epoch / (self.total_epochs - 1), self.alpha_max)
 
-        elif self.schedule == "step":
-            # Equation 15: α = 1 - floor(t/h) / N_h
-            if self.n_steps == 0:
-                return 0.0
-            return 1.0 - (t // self.step_size) / self.n_steps
-
-        elif self.schedule == "cosine":
-            # Equation 16: α = 0.5 * (1 + cos(πt/T))
-            import math
-            return 0.5 * (1.0 + math.cos(math.pi * t / T))
+        elif self.schedule == "constant":
+            return self.alpha_start
 
         else:
-            return 1.0 - t / T  # Default to linear
+            # Default to rebalance
+            alpha = self.alpha_start + epoch * self.alpha_increment
+            return min(alpha, self.alpha_max)
 
 
 class DentalSegmentationLoss(v8SegmentationLoss):
     """
-    Optimized Dental-specific segmentation loss extending v8SegmentationLoss.
+    Dental-specific segmentation loss extending v8SegmentationLoss.
 
-    Adds anatomical constraint loss and Generalized Surface Loss (GSL) for improved
+    Adds anatomical constraint loss and Boundary Loss for improved
     tooth detection and segmentation in dental imaging.
 
-    Loss components: [box, seg, cls, dfl, anatomy, gsl]
+    Loss components: [box, seg, cls, dfl, anatomy, boundary]
 
-    Key optimizations:
-    - No GPU-CPU synchronization points
-    - Pre-registered FDI lookup tensors
-    - Vectorized batch operations
-    - GSL with full iterative DTM
+    The boundary loss is combined with the segmentation loss using the
+    "rebalance" strategy from Kervadec et al.:
+        L_total = (1 - α) * L_seg + α * L_boundary
+
+    Where α starts small (0.01) and increases by 0.01 each epoch.
 
     Attributes:
         FDI_CLASSES (list): Full FDI tooth numbering (32 classes).
-        gsl_loss (GeneralizedSurfaceLoss): Boundary-focused loss module.
+        boundary_loss (BoundaryLoss): Contour-based loss module.
         alpha_scheduler (AlphaScheduler): For loss weighting schedule.
     """
 
@@ -361,64 +256,60 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         self.max_gap = 3
         self.midline_threshold = 3
 
-        # Build FDI mappings as registered buffers
+        # Build FDI mappings
         self._build_fdi_tensors()
 
         # Pre-compute adjacency validity matrix
         self._build_adjacency_matrix()
 
-        # GSL loss with full iterative DTM
-        dtm_iterations = getattr(self.hyp, "dtm_iterations", 30)
+        # Boundary loss (simple and efficient)
+        self.boundary_loss = BoundaryLoss()
 
-        # Load class weights - supports dict, tensor, or file path
-        class_weights = getattr(self.hyp, "gsl_class_weights", None)
-        weights_path = getattr(self.hyp, "gsl_weights_path", None)
-
-        if weights_path is not None:
-            # Load from file
-            import os
-            if os.path.exists(weights_path):
-                class_weights = torch.load(weights_path, weights_only=True)
-                print(f"Loaded GSL class weights from: {weights_path}")
-        elif isinstance(class_weights, dict):
-            class_weights = GeneralizedSurfaceLoss.compute_class_weights(class_weights)
-
-        self.gsl_loss = GeneralizedSurfaceLoss(
-            max_dtm_iterations=dtm_iterations,
-            class_weights=class_weights,
-        )
-
-        # Alpha scheduler (linear by default)
+        # Alpha scheduler using paper's "rebalance" strategy
         total_epochs = getattr(self.hyp, "epochs", 100)
-        self.alpha_scheduler = AlphaScheduler(total_epochs, schedule="linear")
+        alpha_start = getattr(self.hyp, "boundary_alpha_start", 0.01)
+        alpha_increment = getattr(self.hyp, "boundary_alpha_increment", 0.01)
+
+        self.alpha_scheduler = AlphaScheduler(
+            total_epochs=total_epochs,
+            schedule="rebalance",
+            alpha_start=alpha_start,
+            alpha_increment=alpha_increment,
+            alpha_max=1.0,
+        )
         self.current_epoch = 0
+        timing_env = os.getenv("ULTRA_DENTAL_LOSS_TIMING", "")
+        self._timing_enabled = timing_env not in ("", "0", "false", "False")
+        if self._timing_enabled:
+            self._timing_every = int(os.getenv("ULTRA_DENTAL_LOSS_TIMING_EVERY", "50"))
+            sync_env = os.getenv("ULTRA_DENTAL_LOSS_TIMING_SYNC", "")
+            self._timing_sync = sync_env not in ("", "0", "false", "False")
+            self._timing = {"boundary": 0.0, "anatomy": 0.0, "batches": 0}
 
     def _build_fdi_tensors(self):
-        """Build FDI lookup tensors as registered buffers for GPU efficiency."""
-        n = len(self.FDI_CLASSES)
-
+        """Build FDI lookup tensors for GPU efficiency."""
         # FDI codes tensor for direct lookup
-        fdi_tensor = torch.tensor(self.FDI_CLASSES, dtype=torch.long)
-        self.register_buffer("fdi_codes", fdi_tensor)
+        fdi_tensor = torch.tensor(self.FDI_CLASSES, dtype=torch.long, device=self.device)
+        self.fdi_codes = fdi_tensor
 
         # Quadrant lookup (fdi // 10)
         quadrants = fdi_tensor // 10
-        self.register_buffer("quadrant_lookup", quadrants)
+        self.quadrant_lookup = quadrants
 
         # Position lookup (fdi % 10)
         positions = fdi_tensor % 10
-        self.register_buffer("position_lookup", positions)
+        self.position_lookup = positions
 
         # Upper/Lower jaw masks
         upper_mask = (quadrants == 1) | (quadrants == 2)
         lower_mask = (quadrants == 3) | (quadrants == 4)
-        self.register_buffer("upper_jaw_mask", upper_mask)
-        self.register_buffer("lower_jaw_mask", lower_mask)
+        self.upper_jaw_mask = upper_mask
+        self.lower_jaw_mask = lower_mask
 
     def _build_adjacency_matrix(self):
         """Pre-compute adjacency validity matrix for all FDI class pairs."""
         n = len(self.FDI_CLASSES)
-        adjacency = torch.zeros((n, n), dtype=torch.bool)
+        adjacency = torch.zeros((n, n), dtype=torch.bool, device=self.device)
 
         for i, fdi_i in enumerate(self.FDI_CLASSES):
             q_i = fdi_i // 10
@@ -440,7 +331,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                     if n_i <= self.midline_threshold and n_j <= self.midline_threshold:
                         adjacency[i, j] = True
 
-        self.register_buffer("adjacency_valid", adjacency)
+        self.adjacency_valid = adjacency
 
     @staticmethod
     def _same_jaw_static(q1: int, q2: int) -> bool:
@@ -456,7 +347,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         """
         Calculate combined loss for dental segmentation.
 
-        Returns 6 loss components: [box, seg, cls, dfl, anatomy, gsl]
+        Returns 6 loss components: [box, seg, cls, dfl, anatomy, boundary]
         """
         # Initialize 6-component loss vector
         loss = torch.zeros(6, device=self.device)
@@ -525,56 +416,139 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             if tuple(masks.shape[-2:]) != (mask_h, mask_w):
                 masks = F.interpolate(masks[None], (mask_h, mask_w), mode="nearest")[0]
 
-            # Get alpha for current epoch (linear schedule)
-            alpha = self.alpha_scheduler.get_alpha(self.current_epoch)
+            # Standard segmentation loss
+            boundary_weight = getattr(self.hyp, "boundary", 0.0)
+            rep_positions = None
+            rep_gt_indices = None
+            if boundary_weight > 0:
+                rep_positions = []
+                rep_gt_indices = []
+                for i in range(batch_size):
+                    fg_mask_i = fg_mask[i]
+                    if not fg_mask_i.any():
+                        rep_positions.append(torch.empty(0, dtype=torch.long, device=fg_mask.device))
+                        rep_gt_indices.append(torch.empty(0, dtype=torch.long, device=fg_mask.device))
+                        continue
 
-            # Standard segmentation loss (weighted by alpha)
-            seg_loss = self.calculate_segmentation_loss(
-                fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
-            )
+                    fg_idx = fg_mask_i.nonzero(as_tuple=False).squeeze(1)
+                    gt_idx = target_gt_idx[i, fg_idx]
+                    unique_gt, inv = gt_idx.unique(return_inverse=True)
+
+                    if unique_gt.numel() == 0:
+                        rep_positions.append(torch.empty(0, dtype=torch.long, device=fg_mask.device))
+                        rep_gt_indices.append(torch.empty(0, dtype=torch.long, device=fg_mask.device))
+                        continue
+
+                    anchor_scores = target_scores[i, fg_idx].max(dim=1).values
+                    rep_pos = torch.empty_like(unique_gt)
+                    for j in range(unique_gt.numel()):
+                        mask = inv == j
+                        candidates = torch.arange(inv.numel(), device=fg_mask.device)[mask]
+                        scores = anchor_scores[mask]
+                        rep_pos[j] = candidates[scores.argmax()]
+
+                    rep_positions.append(rep_pos)
+                    rep_gt_indices.append(unique_gt)
+
+            if rep_positions is not None:
+                seg_loss, rep_pred_masks = self.calculate_segmentation_loss(
+                    fg_mask,
+                    masks,
+                    target_gt_idx,
+                    target_bboxes,
+                    batch_idx,
+                    proto,
+                    pred_masks,
+                    imgsz,
+                    self.overlap,
+                    rep_positions=rep_positions,
+                )
+            else:
+                seg_loss = self.calculate_segmentation_loss(
+                    fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
+                )
             loss[1] = seg_loss
 
             # Anatomical constraint loss
             anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
             if anatomy_weight > 0:
+                if self._timing_enabled:
+                    if self._timing_sync and pred_scores.is_cuda:
+                        torch.cuda.synchronize()
+                    t_start = time.perf_counter()
                 loss[4] = self.compute_anatomy_loss_vectorized(
-                    pred_scores, pred_bboxes * stride_tensor, target_scores, fg_mask
+                    pred_scores, pred_bboxes * stride_tensor, target_scores, target_gt_idx, fg_mask
                 )
+                if self._timing_enabled:
+                    if self._timing_sync and pred_scores.is_cuda:
+                        torch.cuda.synchronize()
+                    self._timing["anatomy"] += time.perf_counter() - t_start
 
-            # GSL boundary loss (weighted by 1 - alpha)
-            gsl_weight = getattr(self.hyp, "gsl", 0.0)
-            if gsl_weight > 0:
-                gsl_loss_val = self.compute_gsl_loss(
-                    fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz,
-                    target_scores=target_scores,  # Pass for class-weighted GSL
+            # Boundary loss
+            if boundary_weight > 0:
+                if self._timing_enabled:
+                    if self._timing_sync and pred_scores.is_cuda:
+                        torch.cuda.synchronize()
+                    t_start = time.perf_counter()
+                boundary_loss_val = self.compute_boundary_loss(
+                    fg_mask,
+                    masks,
+                    target_gt_idx,
+                    target_bboxes,
+                    batch_idx,
+                    proto,
+                    pred_masks,
+                    imgsz,
+                    target_scores,
+                    rep_pred_masks=rep_pred_masks,
+                    rep_gt_indices=rep_gt_indices,
                 )
-                loss[5] = gsl_loss_val
+                loss[5] = boundary_loss_val
+                if self._timing_enabled:
+                    if self._timing_sync and pred_scores.is_cuda:
+                        torch.cuda.synchronize()
+                    self._timing["boundary"] += time.perf_counter() - t_start
 
         else:
             loss[1] += (proto * 0).sum() + (pred_masks * 0).sum()
 
-        # Apply loss weights with alpha schedule for GSL
-        # Paper: L = α * L_region + (1-α) * L_boundary
-        # We use hyp.box as total segmentation budget, distributed by alpha
-        alpha = self.alpha_scheduler.get_alpha(self.current_epoch)
-        gsl_weight = getattr(self.hyp, "gsl", 0.0)
+        # Apply loss weights
+        # For boundary loss, use rebalance strategy: (1-α)*L_seg + α*L_boundary
+        boundary_weight = getattr(self.hyp, "boundary", 0.0)
 
-        loss[0] *= self.hyp.box
-        if gsl_weight > 0:
-            # When GSL is enabled, distribute box weight between seg and GSL
-            # Total seg contribution = box * (alpha * seg + (1-alpha) * gsl)
-            loss[1] *= self.hyp.box * alpha
-            loss[5] *= self.hyp.box * (1.0 - alpha)
+        loss[0] *= self.hyp.box  # Box loss
+
+        if boundary_weight > 0:
+            # Get alpha for current epoch
+            alpha = self.alpha_scheduler.get_alpha(self.current_epoch)
+
+            # Rebalance: total seg contribution = box * [(1-α)*seg + α*boundary]
+            # This keeps total segmentation contribution constant across epochs
+            loss[1] *= self.hyp.box * (1.0 - alpha)  # Seg loss weighted by (1-α)
+            loss[5] *= self.hyp.box * alpha  # Boundary loss weighted by α
         else:
-            # No GSL, full weight to seg loss
+            # No boundary loss, full weight to seg
             loss[1] *= self.hyp.box
-        loss[2] *= self.hyp.cls
-        loss[3] *= self.hyp.dfl
-        loss[4] *= getattr(self.hyp, "anatomy", 0.0)
+
+        loss[2] *= self.hyp.cls  # Classification loss
+        loss[3] *= self.hyp.dfl  # DFL loss
+        loss[4] *= getattr(self.hyp, "anatomy", 0.0)  # Anatomy loss
+
+        if self._timing_enabled:
+            self._timing["batches"] += 1
+            if self._timing["batches"] % self._timing_every == 0:
+                LOGGER.info(
+                    f"Dental loss timing (last {self._timing_every} batches): "
+                    f"boundary={self._timing['boundary']:.3f}s, "
+                    f"anatomy={self._timing['anatomy']:.3f}s, "
+                    f"sync={self._timing_sync}"
+                )
+                self._timing["boundary"] = 0.0
+                self._timing["anatomy"] = 0.0
 
         return loss * batch_size, loss.detach()
 
-    def compute_gsl_loss(
+    def compute_boundary_loss(
         self,
         fg_mask: torch.Tensor,
         masks: torch.Tensor,
@@ -584,48 +558,88 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         proto: torch.Tensor,
         pred_masks: torch.Tensor,
         imgsz: torch.Tensor,
-        target_scores: torch.Tensor | None = None,
+        target_scores: torch.Tensor,
+        rep_pred_masks: list[torch.Tensor] | None = None,
+        rep_gt_indices: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
-        Compute Generalized Surface Loss for mask quality.
+        Compute boundary loss for mask quality.
 
-        Collects all masks across batch and computes GSL in single forward pass.
+        Collects masks across batch and computes boundary loss in a single forward pass.
+        Uses a single representative anchor per ground-truth instance to reduce EDT cost.
 
         Args:
-            target_scores: Optional target scores for class-weighted GSL.
+            fg_mask: Foreground mask for each batch item.
+            masks: Ground truth masks.
+            target_gt_idx: Target ground truth indices.
+            target_bboxes: Target bounding boxes.
+            batch_idx: Batch indices.
+            proto: Prototype masks.
+            pred_masks: Predicted mask coefficients.
+            imgsz: Image size.
+            target_scores: Target scores per anchor for selection.
+            rep_pred_masks: Optional per-image predicted mask logits for representative anchors.
+            rep_gt_indices: Optional per-image GT indices for representative anchors.
+
+        Returns:
+            Scalar boundary loss value.
         """
         all_pred_masks = []
         all_gt_masks = []
-        all_class_indices = []
+
+        use_cached = rep_pred_masks is not None and rep_gt_indices is not None
 
         for i in range(fg_mask.shape[0]):
-            fg_mask_i = fg_mask[i]
-            if not fg_mask_i.any():
-                continue
+            if use_cached:
+                pred_mask_logits = rep_pred_masks[i]
+                gt_idx = rep_gt_indices[i]
+                if pred_mask_logits.numel() == 0:
+                    continue
 
-            target_gt_idx_i = target_gt_idx[i]
-            pred_masks_i = pred_masks[i]
-            proto_i = proto[i]
+                if self.overlap:
+                    gt_mask = masks[i] == (gt_idx + 1).view(-1, 1, 1)
+                    gt_mask = gt_mask.float()
+                else:
+                    gt_mask = masks[batch_idx.view(-1) == i][gt_idx]
 
-            mask_idx = target_gt_idx_i[fg_mask_i]
-
-            # Get ground truth masks
-            if self.overlap:
-                gt_mask = masks[i] == (mask_idx + 1).view(-1, 1, 1)
-                gt_mask = gt_mask.float()
+                all_pred_masks.append(pred_mask_logits.sigmoid())
+                all_gt_masks.append(gt_mask)
             else:
-                gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
+                fg_mask_i = fg_mask[i]
+                if not fg_mask_i.any():
+                    continue
 
-            # Compute predicted masks
-            pred_mask = torch.einsum("in,nhw->ihw", pred_masks_i[fg_mask_i], proto_i).sigmoid()
+                target_gt_idx_i = target_gt_idx[i]
+                pred_masks_i = pred_masks[i]
+                proto_i = proto[i]
 
-            all_pred_masks.append(pred_mask)
-            all_gt_masks.append(gt_mask)
+                fg_idx = fg_mask_i.nonzero(as_tuple=False).squeeze(1)
+                gt_idx = target_gt_idx_i[fg_idx]
 
-            # Get class indices for this batch item (for class weights)
-            if target_scores is not None and self.gsl_loss.class_weights is not None:
-                class_idx = target_scores[i, fg_mask_i].argmax(dim=-1)
-                all_class_indices.append(class_idx)
+                unique_gt, inv = gt_idx.unique(return_inverse=True)
+                if unique_gt.numel() == 0:
+                    continue
+
+                # Select one representative anchor per GT to avoid per-anchor EDT cost.
+                anchor_scores = target_scores[i, fg_idx].max(dim=1).values
+                rep_anchor = torch.empty_like(unique_gt)
+                for j in range(unique_gt.numel()):
+                    mask = inv == j
+                    candidates = fg_idx[mask]
+                    scores = anchor_scores[mask]
+                    rep_anchor[j] = candidates[scores.argmax()]
+
+                if self.overlap:
+                    gt_mask = masks[i] == (unique_gt + 1).view(-1, 1, 1)
+                    gt_mask = gt_mask.float()
+                else:
+                    gt_mask = masks[batch_idx.view(-1) == i][unique_gt]
+
+                # Compute predicted masks (apply sigmoid for probability).
+                pred_mask = torch.einsum("in,nhw->ihw", pred_masks_i[rep_anchor], proto_i).sigmoid()
+
+                all_pred_masks.append(pred_mask)
+                all_gt_masks.append(gt_mask)
 
         if not all_pred_masks:
             return torch.tensor(0.0, device=proto.device)
@@ -634,18 +648,14 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         pred_masks_cat = torch.cat(all_pred_masks, dim=0)
         gt_masks_cat = torch.cat(all_gt_masks, dim=0)
 
-        # Concatenate class indices if available
-        class_indices_cat = None
-        if all_class_indices:
-            class_indices_cat = torch.cat(all_class_indices, dim=0)
-
-        return self.gsl_loss(pred_masks_cat, gt_masks_cat, class_indices=class_indices_cat)
+        return self.boundary_loss(pred_masks_cat, gt_masks_cat)
 
     def compute_anatomy_loss_vectorized(
         self,
         pred_scores: torch.Tensor,
         pred_bboxes: torch.Tensor,
         target_scores: torch.Tensor,
+        target_gt_idx: torch.Tensor,
         fg_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -659,21 +669,35 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         for i in range(batch_size):
             fg_i = fg_mask[i]
-            n_fg = fg_i.sum()
-
-            if n_fg < 2:
+            if not fg_i.any():
                 continue
 
-            # Get predicted classes (no .tolist())
-            pred_classes = target_scores[i, fg_i].argmax(dim=-1)
-            bboxes = pred_bboxes[i, fg_i]
+            fg_idx = fg_i.nonzero(as_tuple=False).squeeze(1)
+            gt_idx = target_gt_idx[i, fg_idx]
+
+            unique_gt, inv = gt_idx.unique(return_inverse=True)
+            if unique_gt.numel() < 2:
+                continue
+
+            # Select one representative anchor per GT to avoid per-anchor anatomy cost.
+            anchor_scores = target_scores[i, fg_idx].max(dim=1).values
+            rep_anchor = torch.empty_like(unique_gt)
+            for j in range(unique_gt.numel()):
+                mask = inv == j
+                candidates = fg_idx[mask]
+                scores = anchor_scores[mask]
+                rep_anchor[j] = candidates[scores.argmax()]
+
+            # Use predicted classes/bboxes for anatomy constraints.
+            pred_classes = pred_scores[i, rep_anchor].argmax(dim=-1)
+            bboxes = pred_bboxes[i, rep_anchor]
 
             # Compute loss components (all vectorized)
             dup_loss = self._duplicate_loss_fast(pred_classes)
             neighbor_loss = self._neighbor_loss_fast(pred_classes, bboxes)
             ordering_loss = self._ordering_loss_fast(pred_classes, bboxes)
 
-            total_loss = total_loss + dup_loss + neighbor_loss + ordering_loss
+            total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / pred_classes.numel()
             valid_count = valid_count + 1.0
 
         return total_loss / torch.clamp(valid_count, min=1.0)
@@ -694,8 +718,9 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # Compute bbox centers
         centers = (bboxes[:, :2] + bboxes[:, 2:4]) / 2
 
-        # Pairwise distances
-        dists = torch.cdist(centers.unsqueeze(0), centers.unsqueeze(0)).squeeze(0)
+        # Pairwise distances (torch.cdist does not support fp16 on CUDA)
+        centers_f = centers.float()
+        dists = torch.cdist(centers_f.unsqueeze(0), centers_f.unsqueeze(0)).squeeze(0)
         dists = dists + torch.eye(n, device=dists.device) * 1e6
 
         # Find k nearest neighbors

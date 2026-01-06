@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -428,7 +428,8 @@ class v8SegmentationLoss(v8DetectionLoss):
         pred_masks: torch.Tensor,
         imgsz: torch.Tensor,
         overlap: bool,
-    ) -> torch.Tensor:
+        rep_positions: Optional[List[torch.Tensor]] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         """Calculate the loss for instance segmentation.
 
         Args:
@@ -441,6 +442,8 @@ class v8SegmentationLoss(v8DetectionLoss):
             pred_masks (torch.Tensor): Predicted masks for each anchor of shape (BS, N_anchors, 32).
             imgsz (torch.Tensor): Size of the input image as a tensor of shape (2), i.e., (H, W).
             overlap (bool): Whether the masks in `masks` tensor overlap.
+            rep_positions (list[torch.Tensor] | None): Optional per-image positions of representative anchors
+                within the fg_mask indices, used to return predicted mask logits for reuse.
 
         Returns:
             (torch.Tensor): The calculated loss for instance segmentation.
@@ -462,6 +465,8 @@ class v8SegmentationLoss(v8DetectionLoss):
         # Normalize to mask size
         mxyxy = target_bboxes_normalized * torch.tensor([mask_w, mask_h, mask_w, mask_h], device=proto.device)
 
+        rep_pred_masks = [] if rep_positions is not None else None
+
         for i, single_i in enumerate(zip(fg_mask, target_gt_idx, pred_masks, proto, mxyxy, marea, masks)):
             fg_mask_i, target_gt_idx_i, pred_masks_i, proto_i, mxyxy_i, marea_i, masks_i = single_i
             if fg_mask_i.any():
@@ -472,15 +477,27 @@ class v8SegmentationLoss(v8DetectionLoss):
                 else:
                     gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
 
-                loss += self.single_mask_loss(
-                    gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i]
-                )
+                pred_mask_logits = torch.einsum("in,nhw->ihw", pred_masks_i[fg_mask_i], proto_i)
+                loss_mask = F.binary_cross_entropy_with_logits(pred_mask_logits, gt_mask, reduction="none")
+                loss += (crop_mask(loss_mask, mxyxy_i[fg_mask_i]).mean(dim=(1, 2)) / marea_i[fg_mask_i]).sum()
+
+                if rep_positions is not None:
+                    rep_pos_i = rep_positions[i]
+                    if rep_pos_i.numel():
+                        rep_pred_masks.append(pred_mask_logits[rep_pos_i])
+                    else:
+                        rep_pred_masks.append(proto_i[:0])
 
             # WARNING: lines below prevents Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
             else:
                 loss += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
+                if rep_positions is not None:
+                    rep_pred_masks.append(proto_i[:0])
 
-        return loss / fg_mask.sum()
+        loss = loss / fg_mask.sum()
+        if rep_positions is not None:
+            return loss, rep_pred_masks
+        return loss
 
 
 class v8PoseLoss(v8DetectionLoss):

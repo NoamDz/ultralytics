@@ -159,6 +159,10 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
+        "anatomy",
+        "boundary",
+        "boundary_alpha_start",
+        "boundary_alpha_increment",
     }
 )
 CFG_FRACTION_KEYS = frozenset(

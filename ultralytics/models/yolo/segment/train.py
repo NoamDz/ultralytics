@@ -44,9 +44,9 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
 
     def _update_dental_loss_epoch(self, trainer):
         """Update dental loss criterion with current epoch for alpha scheduling."""
-        from ultralytics.utils.torch_utils import de_parallel
+        from ultralytics.utils.torch_utils import unwrap_model
 
-        model = de_parallel(trainer.model)
+        model = unwrap_model(trainer.model)
         if hasattr(model, "criterion") and hasattr(model.criterion, "set_epoch"):
             model.criterion.set_epoch(trainer.epoch)
 
@@ -75,9 +75,9 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
         # Check if dental-specific losses are enabled
-        use_dental = getattr(self.args, "anatomy", 0.0) > 0 or getattr(self.args, "gsl", 0.0) > 0
+        use_dental = getattr(self.args, "anatomy", 0.0) > 0 or getattr(self.args, "boundary", 0.0) > 0
         if use_dental:
-            self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "anatomy_loss", "gsl_loss"
+            self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "anatomy_loss", "boundary_loss"
         else:
             self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss"
         return yolo.segment.SegmentationValidator(
