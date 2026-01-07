@@ -135,8 +135,10 @@ class BoundaryLoss(nn.Module):
         )
 
         # Boundary loss: L_B = mean(φ_G * pred)
-        # Element-wise product and mean
-        boundary_loss = (dist_maps * pred_masks).mean()
+        # Simple per-pixel mean as in the original paper
+        # The loss can be negative (correct predictions) or positive (errors)
+        # Scale by 50 to bring magnitude closer to seg_loss (~1-2)
+        boundary_loss = (dist_maps * pred_masks).mean() * 50.0
 
         return boundary_loss
 
@@ -275,7 +277,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             schedule="rebalance",
             alpha_start=alpha_start,
             alpha_increment=alpha_increment,
-            alpha_max=1.0,
+            alpha_max=0.3,
         )
         self.current_epoch = 0
         timing_env = os.getenv("ULTRA_DENTAL_LOSS_TIMING", "")
