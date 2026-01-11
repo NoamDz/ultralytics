@@ -244,6 +244,8 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
     UPPER_QUADRANTS = {1, 2}
     LOWER_QUADRANTS = {3, 4}
+    ANATOMY_START_RATIO = 0.33  # Start at ~1/3 of anatomy weight
+    ANATOMY_RAMP_EPOCHS = 20  # Epochs to ramp up to full weight
 
     def __init__(self, model):
         """
@@ -288,20 +290,18 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
         self.anatomy_scheduler = None
         if anatomy_weight > 0:
-            anatomy_schedule = getattr(self.hyp, "anatomy_schedule", "constant")
-            anatomy_start = getattr(self.hyp, "anatomy_start", None)
-            anatomy_increment = getattr(self.hyp, "anatomy_increment", 0.0)
-            anatomy_max = getattr(self.hyp, "anatomy_max", None)
-            if anatomy_start is None:
-                anatomy_start = anatomy_weight
-            if anatomy_max is None:
-                anatomy_max = anatomy_weight
+            start = anatomy_weight * self.ANATOMY_START_RATIO
+            ramp_epochs = min(self.ANATOMY_RAMP_EPOCHS, total_epochs) if total_epochs else self.ANATOMY_RAMP_EPOCHS
+            if ramp_epochs <= 0:
+                increment = 0.0
+            else:
+                increment = (anatomy_weight - start) / ramp_epochs
             self.anatomy_scheduler = AlphaScheduler(
                 total_epochs=total_epochs,
-                schedule=anatomy_schedule,
-                alpha_start=anatomy_start,
-                alpha_increment=anatomy_increment,
-                alpha_max=anatomy_max,
+                schedule="rebalance",
+                alpha_start=start,
+                alpha_increment=increment,
+                alpha_max=anatomy_weight,
             )
         self.current_epoch = 0
         timing_env = os.getenv("ULTRA_DENTAL_LOSS_TIMING", "")
