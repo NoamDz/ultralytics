@@ -255,8 +255,14 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         super().__init__(model)
 
         # Anatomical constraint parameters
-        self.max_gap = 3
-        self.midline_threshold = 3
+        self.max_gap = 3  # Max position gap for same-quadrant neighbors
+        self.midline_threshold = 3  # Max position for cross-quadrant same-jaw neighbors
+        self.cross_jaw_gap = 3  # Max position gap for cross-jaw (vertical) neighbors
+
+        # Missing teeth handling: distance threshold for neighbor loss
+        # Neighbors beyond threshold are ignored (likely missing teeth between them)
+        self.neighbor_median_multiplier = 2.5  # Global: 2.5X median of closest distances
+        self.neighbor_closest_multiplier = 2.0  # Per-tooth: 2.0X closest neighbor distance
 
         # Build FDI mappings
         self._build_fdi_tensors()
@@ -309,7 +315,14 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         self.lower_jaw_mask = lower_mask
 
     def _build_adjacency_matrix(self):
-        """Pre-compute adjacency validity matrix for all FDI class pairs."""
+        """
+        Pre-compute adjacency validity matrix for all FDI class pairs.
+
+        Three types of valid neighbors:
+        1. Same quadrant: teeth within max_gap positions (e.g., 14-17)
+        2. Cross-quadrant same jaw: midline teeth across Q1-Q2 or Q3-Q4 (e.g., 11-21)
+        3. Cross-jaw same side: vertical neighbors from opposite jaws (e.g., 18-48, 17-48)
+        """
         n = len(self.FDI_CLASSES)
         adjacency = torch.zeros((n, n), dtype=torch.bool, device=self.device)
 
@@ -324,13 +337,22 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 q_j = fdi_j // 10
                 n_j = fdi_j % 10
 
-                # Same quadrant with small gap
+                # Rule 1: Same quadrant with small gap
+                # Example: 14 and 16 (same Q1, gap=2)
                 if q_i == q_j and abs(n_i - n_j) <= self.max_gap:
                     adjacency[i, j] = True
 
-                # Cross-quadrant same jaw near midline
+                # Rule 2: Cross-quadrant same jaw near midline
+                # Example: 11 and 21 (Q1-Q2 both upper, positions 1-1)
                 elif self._same_jaw_static(q_i, q_j):
                     if n_i <= self.midline_threshold and n_j <= self.midline_threshold:
+                        adjacency[i, j] = True
+
+                # Rule 3: Cross-jaw same side (vertical neighbors)
+                # Example: 18 and 48 (Q1-Q4 right side, same position 8)
+                # Example: 17 and 48 (Q1-Q4 right side, positions 7-8, gap=1)
+                elif self._same_side_static(q_i, q_j):
+                    if abs(n_i - n_j) <= self.cross_jaw_gap:
                         adjacency[i, j] = True
 
         self.adjacency_valid = adjacency
@@ -340,6 +362,25 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         """Check if two quadrants are in the same jaw."""
         upper = {1, 2}
         return (q1 in upper) == (q2 in upper)
+
+    @staticmethod
+    def _same_side_static(q1: int, q2: int) -> bool:
+        """
+        Check if two quadrants are on the same side of the mouth (vertical alignment).
+
+        This identifies teeth that can be cross-jaw neighbors:
+        - Q1 (upper right) aligns with Q4 (lower right)
+        - Q2 (upper left) aligns with Q3 (lower left)
+
+        Returns:
+            True if quadrants are on the same side but different jaws.
+        """
+        right_side = {1, 4}  # Upper right (Q1) and Lower right (Q4)
+        left_side = {2, 3}  # Upper left (Q2) and Lower left (Q3)
+        # Must be different jaws (one upper, one lower) AND same side
+        same_jaw = (q1 in {1, 2}) == (q2 in {1, 2})
+        same_side = (q1 in right_side and q2 in right_side) or (q1 in left_side and q2 in left_side)
+        return (not same_jaw) and same_side
 
     def set_epoch(self, epoch: int):
         """Update current epoch for alpha scheduling."""
@@ -712,7 +753,11 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         return F.relu(counts - 1.0).sum()
 
     def _neighbor_loss_fast(self, pred_classes: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
-        """Penalize invalid spatial neighbors - fast version."""
+        """Penalize invalid spatial neighbors - fast version.
+
+        Includes distance threshold to handle missing teeth: neighbors beyond
+        a dynamic threshold are ignored (likely missing teeth between them).
+        """
         n = pred_classes.shape[0]
         if n < 2:
             return torch.tensor(0.0, device=pred_classes.device)
@@ -733,6 +778,20 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         if self.nc != len(self.FDI_CLASSES):
             return torch.tensor(0.0, device=pred_classes.device)
 
+        # Compute distance thresholds for missing teeth handling
+        # Closest distance for each tooth
+        closest_dists = dists.min(dim=1).values  # Shape: [n]
+
+        # Global threshold: multiplier × median of closest distances
+        median_closest = closest_dists.median()
+        global_threshold = self.neighbor_median_multiplier * median_closest
+
+        # Per-tooth threshold: multiplier × each tooth's closest distance
+        per_tooth_threshold = self.neighbor_closest_multiplier * closest_dists
+
+        # Combined threshold: minimum of global and per-tooth
+        threshold = torch.minimum(global_threshold.expand(n), per_tooth_threshold)
+
         # Vectorized validity check
         loss = torch.tensor(0.0, device=pred_classes.device)
         for j in range(k_actual):
@@ -742,7 +801,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
             # Check validity using pre-registered adjacency matrix
             valid_mask = self.adjacency_valid[pred_classes, neighbor_classes]
-            invalid_mask = ~valid_mask
+
+            # Only penalize invalid neighbors within threshold (skip far neighbors - missing teeth)
+            within_threshold = neighbor_dists <= threshold
+            invalid_mask = ~valid_mask & within_threshold
 
             penalty = (invalid_mask.float() / (neighbor_dists + 1.0)).sum()
             loss = loss + penalty
