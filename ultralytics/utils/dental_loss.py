@@ -285,6 +285,24 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             alpha_increment=alpha_increment,
             alpha_max=0.3,
         )
+        anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
+        self.anatomy_scheduler = None
+        if anatomy_weight > 0:
+            anatomy_schedule = getattr(self.hyp, "anatomy_schedule", "constant")
+            anatomy_start = getattr(self.hyp, "anatomy_start", None)
+            anatomy_increment = getattr(self.hyp, "anatomy_increment", 0.0)
+            anatomy_max = getattr(self.hyp, "anatomy_max", None)
+            if anatomy_start is None:
+                anatomy_start = anatomy_weight
+            if anatomy_max is None:
+                anatomy_max = anatomy_weight
+            self.anatomy_scheduler = AlphaScheduler(
+                total_epochs=total_epochs,
+                schedule=anatomy_schedule,
+                alpha_start=anatomy_start,
+                alpha_increment=anatomy_increment,
+                alpha_max=anatomy_max,
+            )
         self.current_epoch = 0
         timing_env = os.getenv("ULTRA_DENTAL_LOSS_TIMING", "")
         self._timing_enabled = timing_env not in ("", "0", "false", "False")
@@ -386,6 +404,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         """Update current epoch for alpha scheduling."""
         self.current_epoch = epoch
 
+    def _get_anatomy_weight(self) -> float:
+        """Return scheduled anatomy weight for the current epoch."""
+        anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
+        if self.anatomy_scheduler is not None:
+            anatomy_weight = self.anatomy_scheduler.get_alpha(self.current_epoch)
+        return float(anatomy_weight)
+
     def __call__(self, preds, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate combined loss for dental segmentation.
@@ -438,6 +463,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
+        anatomy_weight = self._get_anatomy_weight()
 
         # Classification loss
         loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
@@ -513,7 +539,6 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             loss[1] = seg_loss
 
             # Anatomical constraint loss
-            anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
             if anatomy_weight > 0:
                 if self._timing_enabled:
                     if self._timing_sync and pred_scores.is_cuda:
@@ -575,7 +600,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         loss[2] *= self.hyp.cls  # Classification loss
         loss[3] *= self.hyp.dfl  # DFL loss
-        loss[4] *= getattr(self.hyp, "anatomy", 0.0)  # Anatomy loss
+        loss[4] *= anatomy_weight  # Anatomy loss
 
         if self._timing_enabled:
             self._timing["batches"] += 1
