@@ -246,6 +246,8 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     LOWER_QUADRANTS = {3, 4}
     ANATOMY_START_RATIO = 0.33  # Start at ~1/3 of anatomy weight
     ANATOMY_RAMP_EPOCHS = 20  # Epochs to ramp up to full weight
+    ANATOMY_TOPK = 32  # Use top-K predictions per image for duplicate loss
+    ANATOMY_DUP_NORM_RATIO = 0.5  # Normalize by K * ratio (0.5 => 2x stronger)
 
     def __init__(self, model):
         """
@@ -736,36 +738,24 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         valid_count = torch.tensor(0.0, device=pred_scores.device)
 
         for i in range(batch_size):
-            fg_i = fg_mask[i]
-            if not fg_i.any():
+            scores_i = pred_scores[i]
+            if scores_i.numel() == 0:
                 continue
 
-            fg_idx = fg_i.nonzero(as_tuple=False).squeeze(1)
-            gt_idx = target_gt_idx[i, fg_idx]
-
-            unique_gt, inv = gt_idx.unique(return_inverse=True)
-            if unique_gt.numel() < 2:
+            max_scores = scores_i.max(dim=1).values
+            topk = min(self.ANATOMY_TOPK, max_scores.numel())
+            if topk < 2:
                 continue
 
-            # Select one representative anchor per GT to avoid per-anchor anatomy cost.
-            anchor_scores = target_scores[i, fg_idx].max(dim=1).values
-            rep_anchor = torch.empty_like(unique_gt)
-            for j in range(unique_gt.numel()):
-                mask = inv == j
-                candidates = fg_idx[mask]
-                scores = anchor_scores[mask]
-                rep_anchor[j] = candidates[scores.argmax()]
+            topk_idx = max_scores.topk(topk).indices
+            topk_logits = scores_i[topk_idx]
+            topk_probs = topk_logits.float().softmax(dim=1)
 
-            # Use predicted classes/bboxes for anatomy constraints.
-            pred_classes = pred_scores[i, rep_anchor].argmax(dim=-1)
-            bboxes = pred_bboxes[i, rep_anchor]
+            counts = topk_probs.sum(dim=0)
+            dup_loss = F.relu(counts - 1.0).sum()
 
-            # Compute loss components (all vectorized)
-            dup_loss = self._duplicate_loss_fast(pred_classes)
-            neighbor_loss = self._neighbor_loss_fast(pred_classes, bboxes)
-            ordering_loss = self._ordering_loss_fast(pred_classes, bboxes)
-
-            total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / pred_classes.numel()
+            norm = max(topk * self.ANATOMY_DUP_NORM_RATIO, 1.0)
+            total_loss = total_loss + (dup_loss / norm)
             valid_count = valid_count + 1.0
 
         return total_loss / torch.clamp(valid_count, min=1.0)
