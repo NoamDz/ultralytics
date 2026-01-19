@@ -746,18 +746,25 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         valid_count = torch.tensor(0.0, device=pred_scores.device)
 
         for i in range(batch_size):
-            scores_i = pred_scores[i]
-            if scores_i.numel() == 0:
+            fg_i = fg_mask[i]
+            if not fg_i.any():
                 continue
 
-            max_scores = scores_i.max(dim=1).values
-            topk = min(self.ANATOMY_TOPK, max_scores.numel())
-            if topk < 2:
+            fg_idx = fg_i.nonzero(as_tuple=False).squeeze(1)
+            gt_idx = target_gt_idx[i, fg_idx]
+
+            unique_gt, inv = gt_idx.unique(return_inverse=True)
+            if unique_gt.numel() < 2:
                 continue
 
-            topk_idx = max_scores.topk(topk).indices
-            topk_logits = scores_i[topk_idx]
-            topk_probs = topk_logits.float().softmax(dim=1)
+            # Select one representative anchor per GT (highest scoring)
+            anchor_scores = target_scores[i, fg_idx].max(dim=1).values
+            rep_anchor = torch.empty_like(unique_gt)
+            for j in range(unique_gt.numel()):
+                mask = inv == j
+                candidates = fg_idx[mask]
+                scores = anchor_scores[mask]
+                rep_anchor[j] = candidates[scores.argmax()]
 
             # Get raw scores and bboxes for representative anchors
             pred_scores_subset = pred_scores[i, rep_anchor]  # (n_teeth, num_classes)
