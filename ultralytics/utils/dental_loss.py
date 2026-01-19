@@ -746,26 +746,20 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         valid_count = torch.tensor(0.0, device=pred_scores.device)
 
         for i in range(batch_size):
-            fg_i = fg_mask[i]
-            if not fg_i.any():
+            scores_i = pred_scores[i]
+            if scores_i.numel() == 0:
                 continue
 
-            fg_idx = fg_i.nonzero(as_tuple=False).squeeze(1)
-            gt_idx = target_gt_idx[i, fg_idx]
-
-            unique_gt, inv = gt_idx.unique(return_inverse=True)
-            if unique_gt.numel() < 2:
+            max_scores = scores_i.max(dim=1).values
+            topk = min(self.ANATOMY_TOPK, max_scores.numel())
+            if topk < 2:
                 continue
 
-            # Select one representative anchor per GT to avoid per-anchor anatomy cost.
-            anchor_scores = target_scores[i, fg_idx].max(dim=1).values
-            rep_anchor = torch.empty_like(unique_gt)
-            for j in range(unique_gt.numel()):
-                mask = inv == j
-                candidates = fg_idx[mask]
-                scores = anchor_scores[mask]
-                rep_anchor[j] = candidates[scores.argmax()]
+            topk_idx = max_scores.topk(topk).indices
+            topk_logits = scores_i[topk_idx]
+            topk_probs = topk_logits.float().softmax(dim=1)
 
+<<<<<<< HEAD
             # Get raw scores and bboxes for representative anchors
             pred_scores_subset = pred_scores[i, rep_anchor]  # (n_teeth, num_classes)
             bboxes = pred_bboxes[i, rep_anchor]
@@ -782,6 +776,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             n_teeth = pred_scores_subset.shape[0]
             denom = torch.sqrt(torch.tensor(float(n_teeth), device=pred_classes.device))
             total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / denom
+=======
+            counts = topk_probs.sum(dim=0)
+            dup_loss = F.relu(counts - 1.0).sum()
+
+            norm = max(topk * self.ANATOMY_DUP_NORM_RATIO, 1.0)
+            total_loss = total_loss + (dup_loss / norm)
+>>>>>>> 2741e1ddc2e49baf6bd8942e97367356058db532
             valid_count = valid_count + 1.0
 
         return total_loss / torch.clamp(valid_count, min=1.0)
