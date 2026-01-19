@@ -246,6 +246,8 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     LOWER_QUADRANTS = {3, 4}
     ANATOMY_START_RATIO = 0.33  # Start at ~1/3 of anatomy weight
     ANATOMY_RAMP_EPOCHS = 20  # Epochs to ramp up to full weight
+    ANATOMY_LATE_BOOST_START_FRAC = 0.6  # Start boosting after this fraction of epochs
+    ANATOMY_LATE_BOOST_MAX = 1.5  # Max multiplier by final epoch
 
     def __init__(self, model):
         """
@@ -277,6 +279,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         # Alpha scheduler using paper's "rebalance" strategy
         total_epochs = getattr(self.hyp, "epochs", 100)
+        self.total_epochs = total_epochs
         alpha_start = getattr(self.hyp, "boundary_alpha_start", 0.01)
         alpha_increment = getattr(self.hyp, "boundary_alpha_increment", 0.01)
 
@@ -409,6 +412,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
         if self.anatomy_scheduler is not None:
             anatomy_weight = self.anatomy_scheduler.get_alpha(self.current_epoch)
+        if anatomy_weight > 0 and self.total_epochs:
+            start_epoch = int(self.total_epochs * self.ANATOMY_LATE_BOOST_START_FRAC)
+            if self.current_epoch >= start_epoch:
+                last_epoch = max(self.total_epochs - 1, start_epoch)
+                denom = max(1, last_epoch - start_epoch)
+                progress = min(1.0, (self.current_epoch - start_epoch) / denom)
+                anatomy_weight *= 1.0 + progress * (self.ANATOMY_LATE_BOOST_MAX - 1.0)
         return float(anatomy_weight)
 
     def __call__(self, preds, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -756,26 +766,61 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 scores = anchor_scores[mask]
                 rep_anchor[j] = candidates[scores.argmax()]
 
-            # Use predicted classes/bboxes for anatomy constraints.
-            pred_classes = pred_scores[i, rep_anchor].argmax(dim=-1)
+            # Get raw scores and bboxes for representative anchors
+            pred_scores_subset = pred_scores[i, rep_anchor]  # (n_teeth, num_classes)
             bboxes = pred_bboxes[i, rep_anchor]
 
-            # Compute loss components (all vectorized)
-            dup_loss = self._duplicate_loss_fast(pred_classes)
-            neighbor_loss = self._neighbor_loss_fast(pred_classes, bboxes)
-            ordering_loss = self._ordering_loss_fast(pred_classes, bboxes)
+            # Compute loss components
+            # Use soft (differentiable) duplicate loss for gradient flow
+            dup_loss = self._duplicate_loss_soft(pred_scores_subset)
 
-            total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / pred_classes.numel()
+            # Neighbor and ordering losses still need hard class assignments
+            pred_classes = pred_scores_subset.argmax(dim=-1)
+            neighbor_loss = torch.tensor(0.0, device=pred_classes.device)
+            ordering_loss = torch.tensor(0.0, device=pred_classes.device)
+
+            n_teeth = pred_scores_subset.shape[0]
+            denom = torch.sqrt(torch.tensor(float(n_teeth), device=pred_classes.device))
+            total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / denom
             valid_count = valid_count + 1.0
 
         return total_loss / torch.clamp(valid_count, min=1.0)
 
     def _duplicate_loss_fast(self, pred_classes: torch.Tensor) -> torch.Tensor:
-        """Penalize duplicate class predictions - fast version."""
+        """Penalize duplicate class predictions - fast version (hard counting)."""
         counts = torch.zeros(self.nc, device=pred_classes.device)
         ones = torch.ones_like(pred_classes, dtype=counts.dtype)
         counts.scatter_add_(0, pred_classes, ones)
         return F.relu(counts - 1.0).sum()
+
+    def _duplicate_loss_soft(self, pred_scores_subset: torch.Tensor) -> torch.Tensor:
+        """
+        Penalize duplicate class predictions using soft probabilistic counting.
+
+        Unlike _duplicate_loss_fast which uses hard argmax (non-differentiable),
+        this method uses softmax probabilities allowing gradients to flow back
+        to the classification head.
+
+        Args:
+            pred_scores_subset: Raw logits for representative anchors, shape (n_teeth, num_classes).
+
+        Returns:
+            Differentiable duplicate loss scalar.
+
+        Example:
+            If two detections each assign 0.8 probability to tooth 12:
+            class_prob_sums[tooth_12] = 1.6 → penalty = ReLU(1.6 - 1.0) = 0.6
+        """
+        # Convert logits to probabilities
+        pred_probs = pred_scores_subset.softmax(dim=-1)  # (n_teeth, num_classes)
+
+        # Sum probabilities for each class across all detections
+        class_prob_sums = pred_probs.sum(dim=0)  # (num_classes,)
+
+        # Penalize when sum > 1.0 (indicates duplicate predictions)
+        soft_dup_loss = F.relu(class_prob_sums - 1.0).sum()
+
+        return soft_dup_loss
 
     def _neighbor_loss_fast(self, pred_classes: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
         """Penalize invalid spatial neighbors - fast version.
