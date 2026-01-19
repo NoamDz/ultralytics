@@ -759,7 +759,6 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             topk_logits = scores_i[topk_idx]
             topk_probs = topk_logits.float().softmax(dim=1)
 
-<<<<<<< HEAD
             # Get raw scores and bboxes for representative anchors
             pred_scores_subset = pred_scores[i, rep_anchor]  # (n_teeth, num_classes)
             bboxes = pred_bboxes[i, rep_anchor]
@@ -776,13 +775,6 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             n_teeth = pred_scores_subset.shape[0]
             denom = torch.sqrt(torch.tensor(float(n_teeth), device=pred_classes.device))
             total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / denom
-=======
-            counts = topk_probs.sum(dim=0)
-            dup_loss = F.relu(counts - 1.0).sum()
-
-            norm = max(topk * self.ANATOMY_DUP_NORM_RATIO, 1.0)
-            total_loss = total_loss + (dup_loss / norm)
->>>>>>> 2741e1ddc2e49baf6bd8942e97367356058db532
             valid_count = valid_count + 1.0
 
         return total_loss / torch.clamp(valid_count, min=1.0)
