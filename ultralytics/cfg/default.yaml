@@ -104,6 +104,7 @@ dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 anatomy: 0.0 # (float) anatomical constraint loss gain (dental segment tasks); 0.5 suggested when enabled
+duplicate_loss_type: pairwise # (str) duplicate loss type: "pairwise" (recommended) or "soft" (legacy)
 boundary: 0.0 # (float) boundary loss gain (dental segment tasks); 1.0 to enable with rebalance schedule
 boundary_alpha_start: 0.01 # (float) initial alpha for boundary loss rebalance schedule
 boundary_alpha_increment: 0.01 # (float) alpha increase per epoch for boundary loss schedule

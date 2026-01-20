@@ -268,6 +268,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         self.neighbor_median_multiplier = 2.5  # Global: 2.5X median of closest distances
         self.neighbor_closest_multiplier = 2.0  # Per-tooth: 2.0X closest neighbor distance
 
+        # Duplicate loss type: "pairwise" (recommended) or "soft" (legacy)
+        # - "pairwise": Penalizes pairs of detections competing for same class
+        #               Cannot be "gamed" by the model, sustained gradient signal
+        # - "soft": Sum-based penalty when class probability sums exceed 1.0
+        #           Can be gamed by making one detection borderline
+        self.duplicate_loss_type = getattr(self.hyp, "duplicate_loss_type", "pairwise")
+
         # Build FDI mappings
         self._build_fdi_tensors()
 
@@ -771,8 +778,14 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             bboxes = pred_bboxes[i, rep_anchor]
 
             # Compute loss components
-            # Use soft (differentiable) duplicate loss for gradient flow
-            dup_loss = self._duplicate_loss_soft(pred_scores_subset)
+            # Select duplicate loss based on configuration
+            if self.duplicate_loss_type == "pairwise":
+                # Pairwise contrastive: penalizes pairs competing for same class
+                # Cannot be "gamed", sustained gradient signal throughout training
+                dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
+            else:
+                # Soft sum-based: legacy approach, can be gamed by borderline predictions
+                dup_loss = self._duplicate_loss_soft(pred_scores_subset)
 
             # Neighbor and ordering losses still need hard class assignments
             pred_classes = pred_scores_subset.argmax(dim=-1)
@@ -821,6 +834,63 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         soft_dup_loss = F.relu(class_prob_sums - 1.0).sum()
 
         return soft_dup_loss
+
+    def _duplicate_loss_pairwise(self, pred_scores_subset: torch.Tensor) -> torch.Tensor:
+        """
+        Pairwise contrastive duplicate loss.
+
+        Penalizes when two detections both have high probability for the same class.
+        The product prob[i,c] * prob[j,c] is high only when BOTH detections want
+        class c, directly targeting the duplicate problem.
+
+        Unlike _duplicate_loss_soft which can be "gamed" by the model (making one
+        detection confident and another borderline), this approach requires the
+        model to actually predict different classes to reduce the loss.
+
+        Mathematical interpretation:
+            L = Σ_c Σ_{i≠j} prob[i,c] * prob[j,c]
+              = Σ_c (Σ_i prob[i,c])² - Σ_c Σ_i prob[i,c]²
+
+        This penalizes concentrated probability mass on any single class across
+        multiple detections.
+
+        Args:
+            pred_scores_subset: Raw logits for representative anchors, shape (n_teeth, num_classes).
+
+        Returns:
+            Differentiable duplicate loss scalar.
+
+        Example:
+            Detection A: [0.90, 0.05, 0.05] for class 0 (confident)
+            Detection B: [0.55, 0.40, 0.05] for class 0 (borderline, but argmax=0)
+
+            Pairwise penalty for class 0 = 0.90 × 0.55 = 0.495
+            This is HIGH even though B is borderline.
+
+            To reduce this, B must shift probability away from class 0,
+            which will change its argmax prediction - eliminating the duplicate.
+        """
+        pred_probs = pred_scores_subset.softmax(dim=-1)  # (n, C)
+        n = pred_probs.shape[0]
+
+        if n < 2:
+            return torch.tensor(0.0, device=pred_probs.device)
+
+        # Compute pairwise products for all classes at once
+        # pair_products[i,j,c] = prob[i,c] * prob[j,c]
+        # High value means both detection i and j want class c
+        pair_products = pred_probs.unsqueeze(1) * pred_probs.unsqueeze(0)  # (n, n, C)
+
+        # Create mask to exclude diagonal (self-pairs add bias, not competition)
+        mask = 1.0 - torch.eye(n, device=pred_probs.device)  # (n, n)
+        mask = mask.unsqueeze(-1)  # (n, n, 1) for broadcasting
+
+        # Sum all pairwise competitions, normalized by number of pairs
+        # Normalization ensures loss scale doesn't explode with more detections
+        num_pairs = n * (n - 1)
+        loss = (pair_products * mask).sum() / num_pairs
+
+        return loss
 
     def _neighbor_loss_fast(self, pred_classes: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
         """Penalize invalid spatial neighbors - fast version.
