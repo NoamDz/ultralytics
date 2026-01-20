@@ -885,10 +885,9 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         mask = 1.0 - torch.eye(n, device=pred_probs.device)  # (n, n)
         mask = mask.unsqueeze(-1)  # (n, n, 1) for broadcasting
 
-        # Sum all pairwise competitions, normalized by number of pairs
-        # Normalization ensures loss scale doesn't explode with more detections
-        num_pairs = n * (n - 1)
-        loss = (pair_products * mask).sum() / num_pairs
+        # Sum all pairwise competitions, normalized by number of detections
+        # Dividing by n (not n*(n-1)) keeps loss magnitude comparable to soft loss
+        loss = (pair_products * mask).sum() / n
 
         return loss
 
