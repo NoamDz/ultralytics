@@ -157,6 +157,7 @@ class AlphaScheduler:
         - "rebalance": α starts at alpha_start, increases by alpha_increment each epoch
         - "linear": α = epoch / total_epochs
         - "constant": α stays fixed at alpha_start
+        - "sigmoid": S-shaped curve that ramps up sharply in later epochs
     """
 
     def __init__(
@@ -166,22 +167,32 @@ class AlphaScheduler:
         alpha_start: float = 0.01,
         alpha_increment: float = 0.01,
         alpha_max: float = 1.0,
+        sigmoid_midpoint: float = 0.7,
+        sigmoid_steepness: float = 0.1,
     ):
         """
         Initialize AlphaScheduler.
 
         Args:
             total_epochs (int): Total training epochs.
-            schedule (str): Schedule type - "rebalance", "linear", or "constant".
+            schedule (str): Schedule type - "rebalance", "linear", "constant", or "sigmoid".
             alpha_start (float): Starting alpha value (for rebalance/constant).
             alpha_increment (float): Alpha increase per epoch (for rebalance).
             alpha_max (float): Maximum alpha value (cap).
+            sigmoid_midpoint (float): Fraction of training where sigmoid crosses 50% (0.0-1.0).
+                                      Higher values delay the ramp-up. Default 0.7 means
+                                      50% weight is reached at 70% of training.
+            sigmoid_steepness (float): Controls sharpness of S-curve (0.01-0.5).
+                                       Lower values = sharper transition.
+                                       Default 0.1 gives a smooth but decisive curve.
         """
         self.total_epochs = total_epochs
         self.schedule = schedule
         self.alpha_start = alpha_start
         self.alpha_increment = alpha_increment
         self.alpha_max = alpha_max
+        self.sigmoid_midpoint = sigmoid_midpoint
+        self.sigmoid_steepness = sigmoid_steepness
 
     def get_alpha(self, epoch: int) -> float:
         """
@@ -206,6 +217,25 @@ class AlphaScheduler:
 
         elif self.schedule == "constant":
             return self.alpha_start
+
+        elif self.schedule == "sigmoid":
+            # S-shaped curve: slow start, rapid increase in later epochs, smooth finish
+            # Formula: alpha_max * sigmoid((progress - midpoint) / steepness)
+            # This gives:
+            #   - Low values early (when progress << midpoint)
+            #   - Rapid increase around midpoint
+            #   - Approaches alpha_max at end
+            import math
+
+            if self.total_epochs <= 1:
+                return self.alpha_max
+
+            progress = epoch / (self.total_epochs - 1)  # 0.0 to 1.0
+            x = (progress - self.sigmoid_midpoint) / self.sigmoid_steepness
+            # Clamp x to avoid overflow in exp
+            x = max(-20.0, min(20.0, x))
+            sigmoid_value = 1.0 / (1.0 + math.exp(-x))
+            return self.alpha_max * sigmoid_value
 
         else:
             # Default to rebalance
@@ -298,21 +328,51 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             alpha_max=0.3,
         )
         anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
+        self.anatomy_schedule = getattr(self.hyp, "anatomy_schedule", "sigmoid")
         self.anatomy_scheduler = None
         if anatomy_weight > 0:
-            start = anatomy_weight * self.ANATOMY_START_RATIO
-            ramp_epochs = min(self.ANATOMY_RAMP_EPOCHS, total_epochs) if total_epochs else self.ANATOMY_RAMP_EPOCHS
-            if ramp_epochs <= 0:
-                increment = 0.0
+            if self.anatomy_schedule == "sigmoid":
+                # Sigmoid schedule: S-shaped curve with late ramp-up
+                # Reads midpoint and steepness from config
+                sigmoid_midpoint = getattr(self.hyp, "anatomy_sigmoid_midpoint", 0.7)
+                sigmoid_steepness = getattr(self.hyp, "anatomy_sigmoid_steepness", 0.1)
+                self.anatomy_scheduler = AlphaScheduler(
+                    total_epochs=total_epochs,
+                    schedule="sigmoid",
+                    alpha_max=anatomy_weight,
+                    sigmoid_midpoint=sigmoid_midpoint,
+                    sigmoid_steepness=sigmoid_steepness,
+                )
+            elif self.anatomy_schedule == "linear":
+                # Linear schedule: 0 to anatomy_weight over all epochs
+                self.anatomy_scheduler = AlphaScheduler(
+                    total_epochs=total_epochs,
+                    schedule="linear",
+                    alpha_max=anatomy_weight,
+                )
+            elif self.anatomy_schedule == "constant":
+                # Constant: use anatomy_weight throughout
+                self.anatomy_scheduler = AlphaScheduler(
+                    total_epochs=total_epochs,
+                    schedule="constant",
+                    alpha_start=anatomy_weight,
+                    alpha_max=anatomy_weight,
+                )
             else:
-                increment = (anatomy_weight - start) / ramp_epochs
-            self.anatomy_scheduler = AlphaScheduler(
-                total_epochs=total_epochs,
-                schedule="rebalance",
-                alpha_start=start,
-                alpha_increment=increment,
-                alpha_max=anatomy_weight,
-            )
+                # Default: rebalance (legacy behavior)
+                start = anatomy_weight * self.ANATOMY_START_RATIO
+                ramp_epochs = min(self.ANATOMY_RAMP_EPOCHS, total_epochs) if total_epochs else self.ANATOMY_RAMP_EPOCHS
+                if ramp_epochs <= 0:
+                    increment = 0.0
+                else:
+                    increment = (anatomy_weight - start) / ramp_epochs
+                self.anatomy_scheduler = AlphaScheduler(
+                    total_epochs=total_epochs,
+                    schedule="rebalance",
+                    alpha_start=start,
+                    alpha_increment=increment,
+                    alpha_max=anatomy_weight,
+                )
         self.current_epoch = 0
         timing_env = os.getenv("ULTRA_DENTAL_LOSS_TIMING", "")
         self._timing_enabled = timing_env not in ("", "0", "false", "False")
@@ -419,13 +479,18 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
         if self.anatomy_scheduler is not None:
             anatomy_weight = self.anatomy_scheduler.get_alpha(self.current_epoch)
-        if anatomy_weight > 0 and self.total_epochs:
-            start_epoch = int(self.total_epochs * self.ANATOMY_LATE_BOOST_START_FRAC)
-            if self.current_epoch >= start_epoch:
-                last_epoch = max(self.total_epochs - 1, start_epoch)
-                denom = max(1, last_epoch - start_epoch)
-                progress = min(1.0, (self.current_epoch - start_epoch) / denom)
-                anatomy_weight *= 1.0 + progress * (self.ANATOMY_LATE_BOOST_MAX - 1.0)
+
+        # Apply late boost only for non-sigmoid schedules
+        # Sigmoid already incorporates late ramp-up in its S-curve
+        if self.anatomy_schedule != "sigmoid":
+            if anatomy_weight > 0 and self.total_epochs:
+                start_epoch = int(self.total_epochs * self.ANATOMY_LATE_BOOST_START_FRAC)
+                if self.current_epoch >= start_epoch:
+                    last_epoch = max(self.total_epochs - 1, start_epoch)
+                    denom = max(1, last_epoch - start_epoch)
+                    progress = min(1.0, (self.current_epoch - start_epoch) / denom)
+                    anatomy_weight *= 1.0 + progress * (self.ANATOMY_LATE_BOOST_MAX - 1.0)
+
         return float(anatomy_weight)
 
     def __call__(self, preds, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
