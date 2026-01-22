@@ -276,8 +276,8 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     LOWER_QUADRANTS = {3, 4}
     ANATOMY_START_RATIO = 0.33  # Start at ~1/3 of anatomy weight
     ANATOMY_RAMP_EPOCHS = 20  # Epochs to ramp up to full weight
-    ANATOMY_LATE_BOOST_START_FRAC = 0.6  # Start boosting after this fraction of epochs
-    ANATOMY_LATE_BOOST_MAX = 2.0  # Max multiplier by final epoch
+    ANATOMY_LATE_BOOST_START_FRAC = 0.75  # Start boosting after this fraction of epochs
+    ANATOMY_LATE_BOOST_MAX = 2.2  # Max multiplier by final epoch
 
     def __init__(self, model):
         """
