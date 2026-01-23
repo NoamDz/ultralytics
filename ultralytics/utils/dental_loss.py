@@ -444,6 +444,9 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                         adjacency[i, j] = True
 
         self.adjacency_valid = adjacency
+        # Precompute float invalid adjacency matrix for soft neighbor loss (efficiency)
+        # This avoids bool->float conversion on every forward pass
+        self.invalid_adjacency = (~adjacency).float()
 
     @staticmethod
     def _same_jaw_static(q1: int, q2: int) -> bool:
@@ -843,22 +846,23 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             bboxes = pred_bboxes[i, rep_anchor]
 
             # Compute loss components
-            # Select duplicate loss based on configuration
-            if self.duplicate_loss_type == "pairwise":
-                # Pairwise contrastive: penalizes pairs competing for same class
-                # Cannot be "gamed", sustained gradient signal throughout training
-                dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
-            else:
-                # Soft sum-based: legacy approach, can be gamed by borderline predictions
-                dup_loss = self._duplicate_loss_soft(pred_scores_subset)
+            # Duplicate loss (temporarily disabled for neighbor loss experiments)
+            # TODO: Re-enable after neighbor loss experiments
+            # if self.duplicate_loss_type == "pairwise":
+            #     dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
+            # else:
+            #     dup_loss = self._duplicate_loss_soft(pred_scores_subset)
+            dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
-            # Neighbor and ordering losses still need hard class assignments
-            pred_classes = pred_scores_subset.argmax(dim=-1)
-            neighbor_loss = torch.tensor(0.0, device=pred_classes.device)
-            ordering_loss = torch.tensor(0.0, device=pred_classes.device)
+            # Soft neighbor loss (differentiable) - uses probabilities, not argmax
+            neighbor_loss = self._neighbor_loss_soft(pred_scores_subset, bboxes)
 
+            # Ordering loss (currently disabled - uses hard class assignments)
+            ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
+
+            # Normalize by sqrt(n_teeth) to balance across images with different tooth counts
             n_teeth = pred_scores_subset.shape[0]
-            denom = torch.sqrt(torch.tensor(float(n_teeth), device=pred_classes.device))
+            denom = torch.sqrt(torch.tensor(float(n_teeth), device=pred_scores_subset.device))
             total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / denom
             valid_count = valid_count + 1.0
 
@@ -1011,6 +1015,84 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             invalid_mask = ~valid_mask & within_threshold
 
             penalty = (invalid_mask.float() / (neighbor_dists + 1.0)).sum()
+            loss = loss + penalty
+
+        return loss
+
+    def _neighbor_loss_soft(self, pred_scores: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
+        """
+        Soft differentiable neighbor loss using class probabilities.
+
+        Unlike _neighbor_loss_fast which uses hard argmax (non-differentiable),
+        this method computes the expected probability that two spatially adjacent
+        detections predict an invalid neighbor pair, allowing gradients to flow
+        back to the classification head.
+
+        Formula:
+            For detection i and its k nearest spatial neighbors j:
+            invalid_prob[i,j] = prob_i^T @ invalid_adjacency @ prob_j
+            penalty[i,j] = invalid_prob[i,j] / (distance[i,j] + 1.0)
+
+        Args:
+            pred_scores: Raw logits for detections, shape (n_teeth, num_classes).
+            bboxes: Bounding boxes in xyxy format, shape (n_teeth, 4).
+            k: Number of nearest neighbors to check (default 2).
+
+        Returns:
+            Differentiable neighbor loss scalar.
+        """
+        n = pred_scores.shape[0]
+        if n < 2:
+            return torch.tensor(0.0, device=pred_scores.device)
+
+        # Skip if class count doesn't match FDI
+        if self.nc != len(self.FDI_CLASSES):
+            return torch.tensor(0.0, device=pred_scores.device)
+
+        # Convert logits to probabilities
+        probs = pred_scores.softmax(dim=-1)  # (n, C)
+
+        # Compute bbox centers
+        centers = (bboxes[:, :2] + bboxes[:, 2:4]) / 2
+
+        # Pairwise distances
+        centers_f = centers.float()
+        dists = torch.cdist(centers_f.unsqueeze(0), centers_f.unsqueeze(0)).squeeze(0)
+        dists = dists + torch.eye(n, device=dists.device) * 1e6  # Exclude self
+
+        # Find k nearest neighbors
+        k_actual = min(k, n - 1)
+        _, knn_idx = dists.topk(k_actual, dim=1, largest=False)
+
+        # Compute distance thresholds for missing teeth handling
+        closest_dists = dists.min(dim=1).values
+        median_closest = closest_dists.median()
+        global_threshold = self.neighbor_median_multiplier * median_closest
+        per_tooth_threshold = self.neighbor_closest_multiplier * closest_dists
+        threshold = torch.minimum(global_threshold.expand(n), per_tooth_threshold)
+
+        # Use precomputed invalid adjacency matrix (efficiency optimization)
+        invalid_adjacency = self.invalid_adjacency  # (C, C) float
+
+        # Compute soft neighbor loss
+        loss = torch.tensor(0.0, device=pred_scores.device)
+
+        for j in range(k_actual):
+            neighbor_idx = knn_idx[:, j]  # (n,) indices of j-th nearest neighbor
+            neighbor_probs = probs[neighbor_idx]  # (n, C)
+            neighbor_dists = dists[torch.arange(n, device=dists.device), neighbor_idx]  # (n,)
+
+            # Compute expected invalidity for each pair
+            # invalid_prob[i] = probs[i] @ invalid_adjacency @ neighbor_probs[i]
+            # Vectorized: probs @ invalid_adjacency -> (n, C), then element-wise with neighbor_probs
+            probs_times_invalid = probs @ invalid_adjacency  # (n, C)
+            invalid_prob = (probs_times_invalid * neighbor_probs).sum(dim=1)  # (n,)
+
+            # Apply hard distance threshold (missing teeth handling)
+            within_threshold = (neighbor_dists <= threshold).float()
+
+            # Distance-weighted penalty with threshold mask
+            penalty = (invalid_prob * within_threshold / (neighbor_dists + 1.0)).sum()
             loss = loss + penalty
 
         return loss
