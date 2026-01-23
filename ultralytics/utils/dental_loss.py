@@ -1043,11 +1043,11 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         """
         n = pred_scores.shape[0]
         if n < 2:
-            return torch.tensor(0.0, device=pred_scores.device)
+            return torch.tensor(0.0, device=pred_scores.device, dtype=pred_scores.dtype)
 
         # Skip if class count doesn't match FDI
         if self.nc != len(self.FDI_CLASSES):
-            return torch.tensor(0.0, device=pred_scores.device)
+            return torch.tensor(0.0, device=pred_scores.device, dtype=pred_scores.dtype)
 
         # Convert logits to probabilities
         probs = pred_scores.softmax(dim=-1)  # (n, C)
@@ -1072,10 +1072,11 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         threshold = torch.minimum(global_threshold.expand(n), per_tooth_threshold)
 
         # Use precomputed invalid adjacency matrix (efficiency optimization)
-        invalid_adjacency = self.invalid_adjacency  # (C, C) float
+        # Cast to same dtype as probs for mixed precision training compatibility
+        invalid_adjacency = self.invalid_adjacency.to(dtype=probs.dtype)  # (C, C)
 
         # Compute soft neighbor loss
-        loss = torch.tensor(0.0, device=pred_scores.device)
+        loss = torch.tensor(0.0, device=pred_scores.device, dtype=probs.dtype)
 
         for j in range(k_actual):
             neighbor_idx = knn_idx[:, j]  # (n,) indices of j-th nearest neighbor
@@ -1089,7 +1090,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             invalid_prob = (probs_times_invalid * neighbor_probs).sum(dim=1)  # (n,)
 
             # Apply hard distance threshold (missing teeth handling)
-            within_threshold = (neighbor_dists <= threshold).float()
+            within_threshold = (neighbor_dists <= threshold).to(dtype=probs.dtype)
 
             # Distance-weighted penalty with threshold mask
             penalty = (invalid_prob * within_threshold / (neighbor_dists + 1.0)).sum()
