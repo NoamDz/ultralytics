@@ -16,6 +16,7 @@ References:
 
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -279,6 +280,17 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     ANATOMY_LATE_BOOST_START_FRAC = 0.75  # Start boosting after this fraction of epochs
     ANATOMY_LATE_BOOST_MAX = 2.2  # Max multiplier by final epoch
 
+    # Neighbor loss schedule parameters (three-phase)
+    NEIGHBOR_PHASE1_END = 40  # End of suppressed phase
+    NEIGHBOR_PHASE2_END = 60  # End of ramp-up phase
+    NEIGHBOR_PHASE1_MAX_MULT = 0.1  # Max multiplier at end of phase 1
+    NEIGHBOR_PHASE2_MAX_MULT = 0.5  # Max multiplier at end of phase 2
+    NEIGHBOR_PHASE3_MAX_MULT = 1.5  # Max multiplier at end of phase 3
+
+    # Adaptive margin parameters
+    NEIGHBOR_BASE_MARGIN = 0.3  # Base margin (30% gap requirement)
+    NEIGHBOR_MAX_MARGIN = 0.5  # Max margin at final epoch (50% gap)
+
     def __init__(self, model):
         """
         Initialize DentalSegmentationLoss.
@@ -328,10 +340,20 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             alpha_max=0.3,
         )
         anatomy_weight = getattr(self.hyp, "anatomy", 0.0)
-        self.anatomy_schedule = getattr(self.hyp, "anatomy_schedule", "sigmoid")
+        # Default to "neighbor" schedule which uses three-phase multiplier for late-stage focus
+        self.anatomy_schedule = getattr(self.hyp, "anatomy_schedule", "neighbor")
         self.anatomy_scheduler = None
         if anatomy_weight > 0:
-            if self.anatomy_schedule == "sigmoid":
+            if self.anatomy_schedule == "neighbor":
+                # New three-phase schedule: returns base weight, multiplier applied in loss
+                # The _get_neighbor_multiplier() handles epoch-based scheduling
+                self.anatomy_scheduler = AlphaScheduler(
+                    total_epochs=total_epochs,
+                    schedule="constant",
+                    alpha_start=anatomy_weight,
+                    alpha_max=anatomy_weight,
+                )
+            elif self.anatomy_schedule == "sigmoid":
                 # Sigmoid schedule: S-shaped curve with late ramp-up
                 # Reads midpoint and steepness from config
                 sigmoid_midpoint = getattr(self.hyp, "anatomy_sigmoid_midpoint", 0.7)
@@ -381,6 +403,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             sync_env = os.getenv("ULTRA_DENTAL_LOSS_TIMING_SYNC", "")
             self._timing_sync = sync_env not in ("", "0", "false", "False")
             self._timing = {"boundary": 0.0, "anatomy": 0.0, "batches": 0}
+
+        # Neighbor loss logging (enabled via environment variable)
+        neighbor_log_env = os.getenv("ULTRA_NEIGHBOR_LOSS_LOG", "")
+        self._neighbor_log_enabled = neighbor_log_env not in ("", "0", "false", "False")
+        self._neighbor_log = {"batches": 0, "raw_loss_sum": 0.0, "count": 0}
+        if self._neighbor_log_enabled:
+            self._neighbor_log_every = int(os.getenv("ULTRA_NEIGHBOR_LOSS_LOG_EVERY", "100"))
 
     def _build_fdi_tensors(self):
         """Build FDI lookup tensors for GPU efficiency."""
@@ -483,9 +512,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         if self.anatomy_scheduler is not None:
             anatomy_weight = self.anatomy_scheduler.get_alpha(self.current_epoch)
 
-        # Apply late boost only for non-sigmoid schedules
+        # Apply late boost only for legacy schedules (not sigmoid or neighbor)
         # Sigmoid already incorporates late ramp-up in its S-curve
-        if self.anatomy_schedule != "sigmoid":
+        # Neighbor schedule uses _get_neighbor_multiplier() for late-stage focus
+        if self.anatomy_schedule not in ("sigmoid", "neighbor"):
             if anatomy_weight > 0 and self.total_epochs:
                 start_epoch = int(self.total_epochs * self.ANATOMY_LATE_BOOST_START_FRAC)
                 if self.current_epoch >= start_epoch:
@@ -495,6 +525,65 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                     anatomy_weight *= 1.0 + progress * (self.ANATOMY_LATE_BOOST_MAX - 1.0)
 
         return float(anatomy_weight)
+
+    def _get_neighbor_multiplier(self) -> float:
+        """
+        Get weight multiplier for neighbor loss based on three-phase schedule.
+
+        Phase 1 (Epochs 0-40):   SUPPRESSED  - multiplier = 0.0 → 0.1
+        Phase 2 (Epochs 40-60):  RAMP-UP     - multiplier = 0.1 → 0.5
+        Phase 3 (Epochs 60-100): FULL FORCE  - multiplier = 0.5 → 1.5 (exponential)
+
+        Returns:
+            float: Weight multiplier to apply to base anatomy weight.
+        """
+        epoch = self.current_epoch
+        total = self.total_epochs if self.total_epochs else 100
+
+        phase1_end = self.NEIGHBOR_PHASE1_END
+        phase2_end = self.NEIGHBOR_PHASE2_END
+        phase1_max = self.NEIGHBOR_PHASE1_MAX_MULT
+        phase2_max = self.NEIGHBOR_PHASE2_MAX_MULT
+        phase3_max = self.NEIGHBOR_PHASE3_MAX_MULT
+
+        if epoch < phase1_end:
+            # Phase 1: Linear from 0 to phase1_max
+            progress = epoch / phase1_end
+            multiplier = phase1_max * progress
+        elif epoch < phase2_end:
+            # Phase 2: Linear from phase1_max to phase2_max
+            progress = (epoch - phase1_end) / (phase2_end - phase1_end)
+            multiplier = phase1_max + (phase2_max - phase1_max) * progress
+        else:
+            # Phase 3: Exponential from phase2_max to phase3_max
+            remaining = total - phase2_end
+            if remaining <= 0:
+                multiplier = phase3_max
+            else:
+                progress = (epoch - phase2_end) / remaining
+                # Exponential curve: smoother ramp to peak
+                exp_factor = (math.exp(2 * progress) - 1) / (math.exp(2) - 1)
+                multiplier = phase2_max + (phase3_max - phase2_max) * exp_factor
+
+        return float(multiplier)
+
+    def _get_adaptive_margin(self) -> float:
+        """
+        Get adaptive margin for neighbor loss based on training progress.
+
+        Margin increases linearly from base_margin to max_margin over training.
+        This demands larger class separation as predictions sharpen.
+
+        Returns:
+            float: Margin value for softplus penalty.
+        """
+        epoch = self.current_epoch
+        total = self.total_epochs if self.total_epochs else 100
+
+        progress = epoch / total if total > 0 else 0.0
+        margin = self.NEIGHBOR_BASE_MARGIN + (self.NEIGHBOR_MAX_MARGIN - self.NEIGHBOR_BASE_MARGIN) * progress
+
+        return float(margin)
 
     def __call__(self, preds, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -854,17 +943,47 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             #     dup_loss = self._duplicate_loss_soft(pred_scores_subset)
             dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
-            # Soft neighbor loss (differentiable) - uses probabilities, not argmax
-            neighbor_loss = self._neighbor_loss_soft(pred_scores_subset, bboxes)
+            # Margin-based neighbor loss with softplus (new implementation)
+            # Returns raw loss; weight multiplier applied below
+            neighbor_loss = self._neighbor_loss_margin(pred_scores_subset, bboxes)
+
+            # Legacy soft neighbor loss (disabled - kept for reference)
+            # neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
 
             # Ordering loss (currently disabled - uses hard class assignments)
             ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
+            # Apply three-phase weight multiplier to neighbor loss
+            # This implements late-stage focus: suppressed early, full force late
+            neighbor_multiplier = self._get_neighbor_multiplier()
+
+            # Log raw loss before multiplier (for monitoring)
+            if self._neighbor_log_enabled:
+                self._neighbor_log["raw_loss_sum"] += neighbor_loss.detach().item()
+                self._neighbor_log["count"] += 1
+
+            neighbor_loss = neighbor_loss * neighbor_multiplier
+
             # Normalize by sqrt(n_teeth) to balance across images with different tooth counts
             n_teeth = pred_scores_subset.shape[0]
-            denom = torch.sqrt(torch.tensor(float(n_teeth), device=pred_scores_subset.device))
+            denom = math.sqrt(float(n_teeth))  # Use Python math for scalar - faster than tensor
             total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / denom
             valid_count = valid_count + 1.0
+
+        # Periodic logging of neighbor loss statistics
+        if self._neighbor_log_enabled:
+            self._neighbor_log["batches"] += 1
+            if self._neighbor_log["batches"] % self._neighbor_log_every == 0:
+                avg_raw = self._neighbor_log["raw_loss_sum"] / max(1, self._neighbor_log["count"])
+                margin = self._get_adaptive_margin()
+                multiplier = self._get_neighbor_multiplier()
+                LOGGER.info(
+                    f"Neighbor loss [epoch {self.current_epoch}]: "
+                    f"raw={avg_raw:.4f}, margin={margin:.3f}, mult={multiplier:.3f}, "
+                    f"effective={avg_raw * multiplier:.4f}"
+                )
+                self._neighbor_log["raw_loss_sum"] = 0.0
+                self._neighbor_log["count"] = 0
 
         return total_loss / torch.clamp(valid_count, min=1.0)
 
@@ -1019,9 +1138,131 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         return loss
 
-    def _neighbor_loss_soft(self, pred_scores: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
+    def _neighbor_loss_margin(self, pred_scores: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
         """
-        Soft differentiable neighbor loss using class probabilities.
+        Margin-based neighbor loss using softplus penalty.
+
+        For each detection, computes the gap between probability on valid classes
+        vs. invalid classes (given the neighbor's predicted class). Uses softplus
+        to create a smooth, differentiable penalty that never fully vanishes.
+
+        Formula:
+            gap = max(prob_valid) - max(prob_invalid)
+            penalty = softplus(margin - gap) = log(1 + exp(margin - gap))
+
+        The penalty is high when:
+        - Detection predicts an invalid neighbor class (gap < 0)
+        - Detection is correct but not confident enough (0 < gap < margin)
+
+        The penalty is low (but never zero) when:
+        - Detection confidently predicts a valid class (gap > margin)
+
+        Args:
+            pred_scores: Raw logits for detections, shape (n_teeth, num_classes).
+            bboxes: Bounding boxes in xyxy format, shape (n_teeth, 4).
+            k: Number of nearest neighbors to check (default 2).
+
+        Returns:
+            Differentiable neighbor loss scalar (unweighted - weight applied externally).
+        """
+        n = pred_scores.shape[0]
+        dtype = pred_scores.dtype
+        device = pred_scores.device
+
+        if n < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Skip if class count doesn't match FDI
+        if self.nc != len(self.FDI_CLASSES):
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Get adaptive margin for current epoch
+        margin = self._get_adaptive_margin()
+
+        # Convert logits to probabilities
+        probs = pred_scores.softmax(dim=-1)  # (n, C)
+
+        # Compute bbox centers
+        centers = (bboxes[:, :2] + bboxes[:, 2:4]) / 2
+
+        # Pairwise distances (torch.cdist does not support fp16 on CUDA)
+        centers_f = centers.float()
+        dists = torch.cdist(centers_f.unsqueeze(0), centers_f.unsqueeze(0)).squeeze(0)
+        dists = dists + torch.eye(n, device=device) * 1e6  # Exclude self
+
+        # Find k nearest neighbors
+        k_actual = min(k, n - 1)
+        _, knn_idx = dists.topk(k_actual, dim=1, largest=False)
+
+        # Compute distance thresholds for missing teeth handling
+        closest_dists = dists.min(dim=1).values
+        median_closest = closest_dists.median()
+        global_threshold = self.neighbor_median_multiplier * median_closest
+        per_tooth_threshold = self.neighbor_closest_multiplier * closest_dists
+        threshold = torch.minimum(global_threshold.expand(n), per_tooth_threshold)
+
+        # Get adjacency matrices (cast for mixed precision)
+        invalid_adjacency = self.invalid_adjacency.to(dtype=dtype)  # (C, C)
+        valid_adjacency = 1.0 - invalid_adjacency  # (C, C)
+
+        # Pre-compute values used in loop (efficiency optimization)
+        arange_n = torch.arange(n, device=device)
+        likely_class_self = probs.argmax(dim=1)  # (n,) - same for all neighbors
+
+        # Pre-allocate penalty tensor
+        all_penalties = torch.zeros(k_actual, n, device=device, dtype=dtype)
+
+        for j in range(k_actual):
+            neighbor_idx = knn_idx[:, j]  # (n,) indices of j-th nearest neighbor
+            neighbor_probs = probs[neighbor_idx]  # (n, C)
+            neighbor_dists = dists[arange_n, neighbor_idx]  # (n,)
+
+            # Get most likely class for each neighbor (conditioning)
+            likely_class_neighbor = neighbor_probs.argmax(dim=1)  # (n,)
+
+            # For each detection i, get invalid/valid masks based on neighbor's class
+            invalid_mask = invalid_adjacency[likely_class_neighbor]  # (n, C)
+            valid_mask = valid_adjacency[likely_class_neighbor]  # (n, C)
+
+            # Compute max probability on valid and invalid classes
+            # probs * mask gives 0 where mask is 0, so max of zeros = 0 (correct behavior)
+            max_valid_prob = (probs * valid_mask).max(dim=1).values  # (n,)
+            max_invalid_prob = (probs * invalid_mask).max(dim=1).values  # (n,)
+
+            # Compute gap: positive when valid class dominates
+            gap = max_valid_prob - max_invalid_prob  # (n,)
+
+            # Softplus penalty: log(1 + exp(margin - gap))
+            penalty = F.softplus(margin - gap)  # (n,)
+
+            # Apply distance threshold (ignore far neighbors - likely missing teeth)
+            within_threshold = (neighbor_dists <= threshold).to(dtype=dtype)
+
+            # Symmetric: compute penalty for neighbor conditioned on this detection
+            invalid_mask_neighbor = invalid_adjacency[likely_class_self]  # (n, C)
+            valid_mask_neighbor = valid_adjacency[likely_class_self]  # (n, C)
+
+            max_valid_prob_neighbor = (neighbor_probs * valid_mask_neighbor).max(dim=1).values
+            max_invalid_prob_neighbor = (neighbor_probs * invalid_mask_neighbor).max(dim=1).values
+
+            gap_neighbor = max_valid_prob_neighbor - max_invalid_prob_neighbor
+            penalty_neighbor = F.softplus(margin - gap_neighbor)
+
+            # Average symmetric penalties, apply threshold mask
+            all_penalties[j] = 0.5 * (penalty + penalty_neighbor) * within_threshold
+
+        # Average over all neighbor pairs
+        loss = all_penalties.mean()
+
+        return loss
+
+    def _neighbor_loss_soft_legacy(self, pred_scores: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
+        """
+        LEGACY: Soft differentiable neighbor loss using joint class probabilities.
+
+        NOTE: This method is disabled but kept for reference. It suffers from
+        vanishing gradients as predictions sharpen (joint probability → 0).
+        Use _neighbor_loss_margin instead.
 
         Unlike _neighbor_loss_fast which uses hard argmax (non-differentiable),
         this method computes the expected probability that two spatially adjacent
