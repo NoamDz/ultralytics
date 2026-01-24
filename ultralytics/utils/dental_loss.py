@@ -964,10 +964,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
             neighbor_loss = neighbor_loss * neighbor_multiplier
 
-            # Normalize by sqrt(n_teeth) to balance across images with different tooth counts
-            n_teeth = pred_scores_subset.shape[0]
-            denom = math.sqrt(float(n_teeth))  # Use Python math for scalar - faster than tensor
-            total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss) / denom
+            # Note: sqrt normalization removed for margin loss since _neighbor_loss_margin
+            # already returns mean() over all pairs (proper normalization).
+            # Legacy losses (dup_loss, ordering_loss) would need sqrt normalization if re-enabled.
+            total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss)
             valid_count = valid_count + 1.0
 
         # Periodic logging of neighbor loss statistics
