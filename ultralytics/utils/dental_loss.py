@@ -1610,6 +1610,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # Initialize weights to 1.0 (baseline - same as standard BCE)
         weights = torch.ones_like(bce_raw)
 
+        # Pre-convert distance matrix to correct dtype once (not per batch item)
+        # This avoids repeated dtype conversions inside the loop
+        distance_matrix = self.class_distance_matrix.to(dtype=dtype)  # (32, 32)
+
         # Only apply ordinal weighting to foreground anchors
         for i in range(batch_size):
             fg_i = fg_mask[i]
@@ -1623,13 +1627,11 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             # Get GT class for each foreground anchor (argmax of soft labels)
             gt_classes = target_scores[i, fg_idx].argmax(dim=-1)  # (num_fg,)
 
-            # Get distances from each GT class to all classes
-            # class_distance_matrix[gt_class, k] = distance from gt_class to k
-            # Cast to correct dtype immediately for mixed precision compatibility
-            distances = self.class_distance_matrix[gt_classes].to(dtype=dtype)  # (num_fg, num_classes)
+            # Get distances from each GT class to all classes (already correct dtype)
+            distances = distance_matrix[gt_classes]  # (num_fg, num_classes)
 
             # Compute weights: 1 + alpha * distance
-            # Minimum weight is 1.0 (no reduction below baseline)
+            # Result stays in correct dtype since distances is already converted
             anchor_weights = 1.0 + self.ordinal_alpha * distances  # (num_fg, num_classes)
 
             # Assign weights to foreground positions
