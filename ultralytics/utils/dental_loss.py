@@ -280,12 +280,11 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     ANATOMY_LATE_BOOST_START_FRAC = 0.75  # Start boosting after this fraction of epochs
     ANATOMY_LATE_BOOST_MAX = 2.2  # Max multiplier by final epoch
 
-    # Neighbor loss schedule parameters (three-phase)
-    NEIGHBOR_PHASE1_END = 40  # End of suppressed phase
-    NEIGHBOR_PHASE2_END = 60  # End of ramp-up phase
-    NEIGHBOR_PHASE1_MAX_MULT = 0.1  # Max multiplier at end of phase 1
-    NEIGHBOR_PHASE2_MAX_MULT = 0.5  # Max multiplier at end of phase 2
-    NEIGHBOR_PHASE3_MAX_MULT = 1.5  # Max multiplier at end of phase 3
+    # Neighbor loss schedule parameters (constant + late boost)
+    # No suppression: starts at 1.0, steep ramp 70-80, max from 80 onwards
+    NEIGHBOR_BOOST_START = 70  # Epoch to start boosting
+    NEIGHBOR_BOOST_END = 80  # Epoch to reach maximum (most effectiveness from here)
+    NEIGHBOR_MAX_MULT = 2.0  # Maximum multiplier (reached at BOOST_END, held until end)
 
     # Adaptive margin parameters
     NEIGHBOR_BASE_MARGIN = 0.3  # Base margin (30% gap requirement)
@@ -528,42 +527,37 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
     def _get_neighbor_multiplier(self) -> float:
         """
-        Get weight multiplier for neighbor loss based on three-phase schedule.
+        Get weight multiplier for neighbor loss based on constant + late boost schedule.
 
-        Phase 1 (Epochs 0-40):   SUPPRESSED  - multiplier = 0.0 → 0.1
-        Phase 2 (Epochs 40-60):  RAMP-UP     - multiplier = 0.1 → 0.5
-        Phase 3 (Epochs 60-100): FULL FORCE  - multiplier = 0.5 → 1.5 (exponential)
+        No suppression - full weight from epoch 1, steep ramp 70-80, max from 80+.
+
+        Epochs 0 to BOOST_START (70):   multiplier = 1.0 (constant, full weight)
+        Epochs BOOST_START to BOOST_END (70-80): multiplier = 1.0 → MAX_MULT (steep ramp)
+        Epochs BOOST_END to end (80-100): multiplier = MAX_MULT (maximum effectiveness)
 
         Returns:
             float: Weight multiplier to apply to base anatomy weight.
         """
         epoch = self.current_epoch
-        total = self.total_epochs if self.total_epochs else 100
 
-        phase1_end = self.NEIGHBOR_PHASE1_END
-        phase2_end = self.NEIGHBOR_PHASE2_END
-        phase1_max = self.NEIGHBOR_PHASE1_MAX_MULT
-        phase2_max = self.NEIGHBOR_PHASE2_MAX_MULT
-        phase3_max = self.NEIGHBOR_PHASE3_MAX_MULT
+        boost_start = self.NEIGHBOR_BOOST_START
+        boost_end = self.NEIGHBOR_BOOST_END
+        max_mult = self.NEIGHBOR_MAX_MULT
 
-        if epoch < phase1_end:
-            # Phase 1: Linear from 0 to phase1_max
-            progress = epoch / phase1_end
-            multiplier = phase1_max * progress
-        elif epoch < phase2_end:
-            # Phase 2: Linear from phase1_max to phase2_max
-            progress = (epoch - phase1_end) / (phase2_end - phase1_end)
-            multiplier = phase1_max + (phase2_max - phase1_max) * progress
-        else:
-            # Phase 3: Exponential from phase2_max to phase3_max
-            remaining = total - phase2_end
-            if remaining <= 0:
-                multiplier = phase3_max
+        if epoch < boost_start:
+            # Constant phase: full weight from start
+            multiplier = 1.0
+        elif epoch < boost_end:
+            # Ramp phase: steep linear increase from 1.0 to max_mult
+            ramp_duration = boost_end - boost_start
+            if ramp_duration <= 0:
+                multiplier = max_mult
             else:
-                progress = (epoch - phase2_end) / remaining
-                # Exponential curve: smoother ramp to peak
-                exp_factor = (math.exp(2 * progress) - 1) / (math.exp(2) - 1)
-                multiplier = phase2_max + (phase3_max - phase2_max) * exp_factor
+                progress = (epoch - boost_start) / ramp_duration
+                multiplier = 1.0 + (max_mult - 1.0) * progress
+        else:
+            # Maximum phase: hold at max_mult for most effectiveness
+            multiplier = max_mult
 
         return float(multiplier)
 
