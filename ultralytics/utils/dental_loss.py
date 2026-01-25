@@ -1625,12 +1625,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
             # Get distances from each GT class to all classes
             # class_distance_matrix[gt_class, k] = distance from gt_class to k
-            distances = self.class_distance_matrix[gt_classes]  # (num_fg, num_classes)
+            # Cast to correct dtype immediately for mixed precision compatibility
+            distances = self.class_distance_matrix[gt_classes].to(dtype=dtype)  # (num_fg, num_classes)
 
             # Compute weights: 1 + alpha * distance
             # Minimum weight is 1.0 (no reduction below baseline)
-            # Cast to same dtype as weights for mixed precision compatibility
-            anchor_weights = (1.0 + self.ordinal_alpha * distances).to(dtype=dtype)  # (num_fg, num_classes)
+            anchor_weights = 1.0 + self.ordinal_alpha * distances  # (num_fg, num_classes)
 
             # Assign weights to foreground positions
             weights[i, fg_idx] = anchor_weights
