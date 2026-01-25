@@ -1629,7 +1629,8 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
             # Compute weights: 1 + alpha * distance
             # Minimum weight is 1.0 (no reduction below baseline)
-            anchor_weights = 1.0 + self.ordinal_alpha * distances.to(dtype)  # (num_fg, num_classes)
+            # Cast to same dtype as weights for mixed precision compatibility
+            anchor_weights = (1.0 + self.ordinal_alpha * distances).to(dtype=dtype)  # (num_fg, num_classes)
 
             # Assign weights to foreground positions
             weights[i, fg_idx] = anchor_weights
