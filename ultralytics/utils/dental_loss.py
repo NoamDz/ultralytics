@@ -290,6 +290,11 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     NEIGHBOR_BASE_MARGIN = 0.3  # Base margin (30% gap requirement)
     NEIGHBOR_MAX_MARGIN = 0.5  # Max margin at final epoch (50% gap)
 
+    # Ordinal classification loss parameters
+    ORDINAL_SAME_QUAD_BASE = 0  # Base distance for same quadrant (position diff added)
+    ORDINAL_ADJ_QUAD_BASE = 4   # Base distance for adjacent quadrants (midline/vertical)
+    ORDINAL_OPP_QUAD_BASE = 8   # Base distance for opposite quadrants (Q1-Q3, Q2-Q4)
+
     def __init__(self, model):
         """
         Initialize DentalSegmentationLoss.
@@ -410,6 +415,17 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         if self._neighbor_log_enabled:
             self._neighbor_log_every = int(os.getenv("ULTRA_NEIGHBOR_LOSS_LOG_EVERY", "100"))
 
+        # GT-conditioned neighbor loss (aligns training with evaluation metric)
+        # Default: True - uses GT neighbor class instead of predicted neighbor class
+        self.neighbor_gt_conditioned = getattr(self.hyp, "neighbor_gt_conditioned", True)
+
+        # Ordinal classification loss settings
+        # Default: 0.3 - adds 30% extra penalty per unit of class distance
+        # This penalizes distant class errors more than nearby errors
+        self.ordinal_alpha = getattr(self.hyp, "ordinal_alpha", 0.3)
+        if self.ordinal_alpha > 0:
+            self._build_distance_matrix()
+
     def _build_fdi_tensors(self):
         """Build FDI lookup tensors for GPU efficiency."""
         # FDI codes tensor for direct lookup
@@ -475,6 +491,51 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # Precompute float invalid adjacency matrix for soft neighbor loss (efficiency)
         # This avoids bool->float conversion on every forward pass
         self.invalid_adjacency = (~adjacency).float()
+
+    def _build_distance_matrix(self):
+        """
+        Precompute distance matrix between all FDI class pairs for ordinal loss.
+
+        Distance reflects anatomical proximity:
+        - Same quadrant: |pos_a - pos_b|  (0-7)
+        - Same jaw or same side: ORDINAL_ADJ_QUAD_BASE + |pos_a - pos_b|  (4-11)
+        - Opposite corner: ORDINAL_OPP_QUAD_BASE + |pos_a - pos_b|  (8-15)
+
+        This is used by ordinal classification loss to penalize distant errors more.
+        """
+        n = len(self.FDI_CLASSES)
+        distance = torch.zeros((n, n), dtype=torch.float32, device=self.device)
+
+        for i, fdi_i in enumerate(self.FDI_CLASSES):
+            quad_i = fdi_i // 10
+            pos_i = fdi_i % 10
+
+            for j, fdi_j in enumerate(self.FDI_CLASSES):
+                if i == j:
+                    distance[i, j] = 0
+                    continue
+
+                quad_j = fdi_j // 10
+                pos_j = fdi_j % 10
+
+                pos_diff = abs(pos_i - pos_j)
+
+                if quad_i == quad_j:
+                    # Same quadrant: just position difference
+                    distance[i, j] = self.ORDINAL_SAME_QUAD_BASE + pos_diff
+                else:
+                    # Different quadrant - check relationship
+                    same_jaw = self._same_jaw_static(quad_i, quad_j)
+                    same_side = self._same_side_static(quad_i, quad_j)
+
+                    if same_jaw or same_side:
+                        # Adjacent quadrants (midline or vertical)
+                        distance[i, j] = self.ORDINAL_ADJ_QUAD_BASE + pos_diff
+                    else:
+                        # Opposite corners (Q1-Q3 or Q2-Q4)
+                        distance[i, j] = self.ORDINAL_OPP_QUAD_BASE + pos_diff
+
+        self.class_distance_matrix = distance
 
     @staticmethod
     def _same_jaw_static(q1: int, q2: int) -> bool:
@@ -633,8 +694,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         target_scores_sum = max(target_scores.sum(), 1)
         anatomy_weight = self._get_anatomy_weight()
 
-        # Classification loss
-        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        # Classification loss (standard or ordinal-weighted)
+        if self.ordinal_alpha > 0:
+            # Ordinal-weighted: penalizes distant class errors more
+            loss[2] = self._ordinal_classification_loss(pred_scores, target_scores, fg_mask)
+        else:
+            # Standard BCE
+            loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
         if fg_mask.sum():
             # Bbox loss
@@ -928,6 +994,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             pred_scores_subset = pred_scores[i, rep_anchor]  # (n_teeth, num_classes)
             bboxes = pred_bboxes[i, rep_anchor]
 
+            # Extract GT classes for representative anchors (for GT-conditioned loss)
+            # target_scores has soft labels where argmax = GT class
+            gt_classes_subset = target_scores[i, rep_anchor].argmax(dim=-1)  # (n_teeth,)
+
             # Compute loss components
             # Duplicate loss (temporarily disabled for neighbor loss experiments)
             # TODO: Re-enable after neighbor loss experiments
@@ -937,9 +1007,15 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             #     dup_loss = self._duplicate_loss_soft(pred_scores_subset)
             dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
-            # Margin-based neighbor loss with softplus (new implementation)
-            # Returns raw loss; weight multiplier applied below
-            neighbor_loss = self._neighbor_loss_margin(pred_scores_subset, bboxes)
+            # Neighbor loss: choose between GT-conditioned and pred-conditioned
+            if self.neighbor_gt_conditioned:
+                # GT-conditioned: aligns training with evaluation metric
+                neighbor_loss = self._neighbor_loss_gt_conditioned(
+                    pred_scores_subset, bboxes, gt_classes_subset
+                )
+            else:
+                # Pred-conditioned (legacy): uses predicted neighbor classes
+                neighbor_loss = self._neighbor_loss_margin(pred_scores_subset, bboxes)
 
             # Legacy soft neighbor loss (disabled - kept for reference)
             # neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
@@ -1250,6 +1326,108 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         return loss
 
+    def _neighbor_loss_gt_conditioned(
+        self,
+        pred_scores: torch.Tensor,
+        bboxes: torch.Tensor,
+        gt_classes: torch.Tensor,
+        k: int = 2,
+    ) -> torch.Tensor:
+        """
+        GT-conditioned neighbor loss using softplus penalty.
+
+        KEY DIFFERENCE from _neighbor_loss_margin:
+        - Uses GT class of neighbor instead of predicted class
+        - This aligns training with the evaluation metric (which uses GT neighbors)
+
+        For each detection A with spatial neighbor B:
+        - Check if pred_A is valid neighbor of gt_B (NOT pred_B)
+        - Penalize using softplus if the gap is below margin
+
+        This catches cases where both predictions are wrong but "consistent" -
+        the pred-conditioned loss misses these because it only checks pred vs pred.
+
+        Args:
+            pred_scores: Raw logits for detections, shape (n_teeth, num_classes).
+            bboxes: Bounding boxes in xyxy format, shape (n_teeth, 4).
+            gt_classes: GT class indices (0-31), shape (n_teeth,).
+            k: Number of nearest neighbors to check (default 2).
+
+        Returns:
+            Differentiable neighbor loss scalar.
+        """
+        n = pred_scores.shape[0]
+        dtype = pred_scores.dtype
+        device = pred_scores.device
+
+        if n < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        if self.nc != len(self.FDI_CLASSES):
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        margin = self._get_adaptive_margin()
+        probs = pred_scores.softmax(dim=-1)  # (n, C)
+
+        # Compute bbox centers and distances
+        centers = (bboxes[:, :2] + bboxes[:, 2:4]) / 2
+        centers_f = centers.float()
+        dists = torch.cdist(centers_f.unsqueeze(0), centers_f.unsqueeze(0)).squeeze(0)
+        dists = dists + torch.eye(n, device=device) * 1e6
+
+        k_actual = min(k, n - 1)
+        _, knn_idx = dists.topk(k_actual, dim=1, largest=False)
+
+        # Distance thresholds for missing teeth handling
+        closest_dists = dists.min(dim=1).values
+        median_closest = closest_dists.median()
+        global_threshold = self.neighbor_median_multiplier * median_closest
+        per_tooth_threshold = self.neighbor_closest_multiplier * closest_dists
+        threshold = torch.minimum(global_threshold.expand(n), per_tooth_threshold)
+
+        # Adjacency matrices
+        invalid_adjacency = self.invalid_adjacency.to(dtype=dtype)
+        valid_adjacency = 1.0 - invalid_adjacency
+
+        arange_n = torch.arange(n, device=device)
+        all_penalties = torch.zeros(k_actual, n, device=device, dtype=dtype)
+
+        for j in range(k_actual):
+            neighbor_idx = knn_idx[:, j]
+            neighbor_probs = probs[neighbor_idx]
+            neighbor_dists = dists[arange_n, neighbor_idx]
+
+            # KEY CHANGE: Use GT class of neighbor instead of predicted class
+            gt_class_neighbor = gt_classes[neighbor_idx]  # (n,)
+
+            # Get valid/invalid masks based on GT neighbor class
+            invalid_mask = invalid_adjacency[gt_class_neighbor]  # (n, C)
+            valid_mask = valid_adjacency[gt_class_neighbor]      # (n, C)
+
+            # Compute max probability on valid vs invalid classes
+            max_valid_prob = (probs * valid_mask).max(dim=1).values
+            max_invalid_prob = (probs * invalid_mask).max(dim=1).values
+
+            gap = max_valid_prob - max_invalid_prob
+            penalty = F.softplus(margin - gap)
+
+            within_threshold = (neighbor_dists <= threshold).to(dtype=dtype)
+
+            # Symmetric: check neighbor's prediction against this detection's GT
+            gt_class_self = gt_classes  # (n,)
+            invalid_mask_neighbor = invalid_adjacency[gt_class_self]
+            valid_mask_neighbor = valid_adjacency[gt_class_self]
+
+            max_valid_neighbor = (neighbor_probs * valid_mask_neighbor).max(dim=1).values
+            max_invalid_neighbor = (neighbor_probs * invalid_mask_neighbor).max(dim=1).values
+
+            gap_neighbor = max_valid_neighbor - max_invalid_neighbor
+            penalty_neighbor = F.softplus(margin - gap_neighbor)
+
+            all_penalties[j] = 0.5 * (penalty + penalty_neighbor) * within_threshold
+
+        return all_penalties.mean()
+
     def _neighbor_loss_soft_legacy(self, pred_scores: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
         """
         LEGACY: Soft differentiable neighbor loss using joint class probabilities.
@@ -1390,3 +1568,77 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         diff = x.unsqueeze(1) - x.unsqueeze(0)
         ranks = torch.sigmoid(diff * 5.0).sum(dim=1)
         return ranks / n
+
+    def _ordinal_classification_loss(
+        self,
+        pred_scores: torch.Tensor,
+        target_scores: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Ordinal-weighted classification loss.
+
+        Penalizes predictions based on distance from GT class:
+        - Nearby wrong class (off-by-1): baseline penalty × (1 + alpha)
+        - Distant wrong class (different quadrant): baseline penalty × (1 + alpha * distance)
+
+        This makes the model prefer "close" mistakes over "far" mistakes,
+        which should help reduce violations caused by cross-quadrant confusions.
+
+        The weight formula is: weight[k] = 1 + alpha * distance(k, gt_class)
+        where distance is computed by _build_distance_matrix().
+
+        Args:
+            pred_scores: Raw classification logits, shape (batch, num_anchors, num_classes).
+            target_scores: Soft target labels from assigner, shape (batch, num_anchors, num_classes).
+            fg_mask: Foreground mask, shape (batch, num_anchors).
+
+        Returns:
+            Weighted classification loss scalar.
+        """
+        batch_size = pred_scores.shape[0]
+        dtype = pred_scores.dtype
+        device = pred_scores.device
+
+        # Standard BCE (unreduced)
+        bce_raw = F.binary_cross_entropy_with_logits(
+            pred_scores,
+            target_scores.to(dtype),
+            reduction='none'
+        )  # (batch, num_anchors, num_classes)
+
+        # Initialize weights to 1.0 (baseline - same as standard BCE)
+        weights = torch.ones_like(bce_raw)
+
+        # Only apply ordinal weighting to foreground anchors
+        for i in range(batch_size):
+            fg_i = fg_mask[i]
+            if not fg_i.any():
+                continue
+
+            fg_idx = fg_i.nonzero(as_tuple=False).squeeze(-1)
+            if fg_idx.dim() == 0:
+                fg_idx = fg_idx.unsqueeze(0)
+
+            # Get GT class for each foreground anchor (argmax of soft labels)
+            gt_classes = target_scores[i, fg_idx].argmax(dim=-1)  # (num_fg,)
+
+            # Get distances from each GT class to all classes
+            # class_distance_matrix[gt_class, k] = distance from gt_class to k
+            distances = self.class_distance_matrix[gt_classes]  # (num_fg, num_classes)
+
+            # Compute weights: 1 + alpha * distance
+            # Minimum weight is 1.0 (no reduction below baseline)
+            anchor_weights = 1.0 + self.ordinal_alpha * distances.to(dtype)  # (num_fg, num_classes)
+
+            # Assign weights to foreground positions
+            weights[i, fg_idx] = anchor_weights
+
+        # Apply weights and reduce
+        weighted_bce = bce_raw * weights
+
+        # Normalize by sum of target scores (same as standard YOLO cls loss)
+        target_scores_sum = max(target_scores.sum(), 1)
+        loss = weighted_bce.sum() / target_scores_sum
+
+        return loss
