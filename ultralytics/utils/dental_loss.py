@@ -1610,9 +1610,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # Initialize weights to 1.0 (baseline - same as standard BCE)
         weights = torch.ones_like(bce_raw)
 
-        # Pre-convert distance matrix to correct dtype once (not per batch item)
-        # This avoids repeated dtype conversions inside the loop
-        distance_matrix = self.class_distance_matrix.to(dtype=dtype)  # (32, 32)
+        # Pre-convert distance matrix to match weights dtype (not pred_scores dtype!)
+        # In AMP, bce_raw may be Half even if pred_scores is Float32 due to autocast
+        # We must match weights.dtype for the assignment to work
+        distance_matrix = self.class_distance_matrix.to(dtype=weights.dtype)  # (32, 32)
 
         # Only apply ordinal weighting to foreground anchors
         for i in range(batch_size):
