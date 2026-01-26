@@ -281,10 +281,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     ANATOMY_LATE_BOOST_MAX = 2.2  # Max multiplier by final epoch
 
     # Neighbor loss schedule parameters (constant + late boost)
-    # No suppression: starts at 1.0, steep ramp 70-80, max from 80 onwards
-    NEIGHBOR_BOOST_START = 70  # Epoch to start boosting
+    # No suppression: starts at 1.0, gradual ramp 50-80, max from 80 onwards
+    NEIGHBOR_BOOST_START = 50  # Epoch to start boosting
     NEIGHBOR_BOOST_END = 80  # Epoch to reach maximum (most effectiveness from here)
-    NEIGHBOR_MAX_MULT = 2.0  # Maximum multiplier (reached at BOOST_END, held until end)
+    NEIGHBOR_MAX_MULT = 2.5  # Maximum multiplier (reached at BOOST_END, held until end)
 
     # Adaptive margin parameters
     NEIGHBOR_BASE_MARGIN = 0.3  # Base margin (30% gap requirement)
@@ -416,8 +416,9 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             self._neighbor_log_every = int(os.getenv("ULTRA_NEIGHBOR_LOSS_LOG_EVERY", "100"))
 
         # GT-conditioned neighbor loss (aligns training with evaluation metric)
-        # Default: True - uses GT neighbor class instead of predicted neighbor class
-        self.neighbor_gt_conditioned = getattr(self.hyp, "neighbor_gt_conditioned", True)
+        # Default: False - GT-conditioned was found to hurt performance
+        # Uses soft neighbor loss (original implementation) instead
+        self.neighbor_gt_conditioned = getattr(self.hyp, "neighbor_gt_conditioned", False)
 
         # Ordinal classification loss settings
         # Default: 0.3 - adds 30% extra penalty per unit of class distance
@@ -1007,18 +1008,16 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             #     dup_loss = self._duplicate_loss_soft(pred_scores_subset)
             dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
-            # Neighbor loss: choose between GT-conditioned and pred-conditioned
+            # Neighbor loss: choose between GT-conditioned and soft (original)
             if self.neighbor_gt_conditioned:
-                # GT-conditioned: aligns training with evaluation metric
+                # GT-conditioned: uses GT neighbor class (found to hurt performance)
                 neighbor_loss = self._neighbor_loss_gt_conditioned(
                     pred_scores_subset, bboxes, gt_classes_subset
                 )
             else:
-                # Pred-conditioned (legacy): uses predicted neighbor classes
-                neighbor_loss = self._neighbor_loss_margin(pred_scores_subset, bboxes)
-
-            # Legacy soft neighbor loss (disabled - kept for reference)
-            # neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
+                # Soft neighbor loss (original implementation)
+                # Uses joint probability of invalid neighbor pairs
+                neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
 
             # Ordering loss (currently disabled - uses hard class assignments)
             ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
