@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 
 from ultralytics.utils import LOGGER
 from ultralytics.utils.loss import v8SegmentationLoss
@@ -281,10 +282,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     ANATOMY_LATE_BOOST_MAX = 2.2  # Max multiplier by final epoch
 
     # Neighbor loss schedule parameters (constant + late boost)
-    # No suppression: starts at 1.0, gradual ramp 50-80, max from 80 onwards
-    NEIGHBOR_BOOST_START = 50  # Epoch to start boosting
+    # No suppression: starts at 1.0, ramp 70-80 to 5.0, max from 80 onwards
+    NEIGHBOR_BOOST_START = 70  # Epoch to start boosting
     NEIGHBOR_BOOST_END = 80  # Epoch to reach maximum (most effectiveness from here)
-    NEIGHBOR_MAX_MULT = 2.5  # Maximum multiplier (reached at BOOST_END, held until end)
+    NEIGHBOR_MAX_MULT = 5.0  # Maximum multiplier (reached at BOOST_END, held until end)
 
     # Adaptive margin parameters
     NEIGHBOR_BASE_MARGIN = 0.3  # Base margin (30% gap requirement)
@@ -314,12 +315,15 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         self.neighbor_median_multiplier = 2.5  # Global: 2.5X median of closest distances
         self.neighbor_closest_multiplier = 2.0  # Per-tooth: 2.0X closest neighbor distance
 
-        # Duplicate loss type: "pairwise" (recommended) or "soft" (legacy)
-        # - "pairwise": Penalizes pairs of detections competing for same class
-        #               Cannot be "gamed" by the model, sustained gradient signal
+        # Duplicate loss type options:
         # - "soft": Sum-based penalty when class probability sums exceed 1.0
         #           Can be gamed by making one detection borderline
-        self.duplicate_loss_type = getattr(self.hyp, "duplicate_loss_type", "pairwise")
+        # - "pairwise": Penalizes pairs of detections competing for same class
+        #               Cannot be "gamed" by the model, sustained gradient signal
+        # - "hungarian": DETR-style bipartite matching for optimal 1:1 assignment (DEFAULT)
+        #                Explicit unique targets, strongest gradient signal
+        #                Reference: Carion et al., ECCV 2020
+        self.duplicate_loss_type = getattr(self.hyp, "duplicate_loss_type", "hungarian")
 
         # Build FDI mappings
         self._build_fdi_tensors()
@@ -1000,13 +1004,19 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             gt_classes_subset = target_scores[i, rep_anchor].argmax(dim=-1)  # (n_teeth,)
 
             # Compute loss components
-            # Duplicate loss (temporarily disabled for neighbor loss experiments)
-            # TODO: Re-enable after neighbor loss experiments
-            # if self.duplicate_loss_type == "pairwise":
-            #     dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
-            # else:
-            #     dup_loss = self._duplicate_loss_soft(pred_scores_subset)
-            dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
+            # Duplicate loss: enforces unique class predictions
+            if self.duplicate_loss_type == "hungarian":
+                # DETR-style bipartite matching (Carion et al., ECCV 2020)
+                dup_loss = self._duplicate_loss_hungarian(pred_scores_subset)
+            elif self.duplicate_loss_type == "pairwise":
+                # Pairwise contrastive loss
+                dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
+            elif self.duplicate_loss_type == "soft":
+                # Sum-based soft loss
+                dup_loss = self._duplicate_loss_soft(pred_scores_subset)
+            else:
+                # Disabled (for ablation studies)
+                dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
             # Neighbor loss: choose between GT-conditioned and soft (original)
             if self.neighbor_gt_conditioned:
@@ -1145,6 +1155,102 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # Sum all pairwise competitions, normalized by number of detections
         # Dividing by n (not n*(n-1)) keeps loss magnitude comparable to soft loss
         loss = (pair_products * mask).sum() / n
+
+        return loss
+
+    def _duplicate_loss_hungarian(self, pred_scores_subset: torch.Tensor) -> torch.Tensor:
+        """
+        Hungarian (bipartite matching) duplicate loss.
+
+        Uses the Hungarian algorithm to find optimal 1:1 assignment of detections
+        to classes based on predicted probabilities, then penalizes detections for
+        not being confident about their assigned class.
+
+        Inspired by DETR (Carion et al., "End-to-End Object Detection with
+        Transformers", ECCV 2020), which uses bipartite matching to ensure unique
+        predictions. We adapt this for class-level duplicate prevention.
+
+        Algorithm:
+            1. Build cost matrix: C[i,j] = -prob[detection_i, class_j]
+            2. Find optimal assignment using Hungarian algorithm (scipy)
+            3. Compute cross-entropy loss on assigned (detection, class) pairs
+
+        Key properties:
+            - Optimal: Finds globally optimal unique assignment
+            - Explicit targets: Each detection gets a specific class to predict
+            - Direct gradient: Clear signal to increase prob for assigned class
+
+        Args:
+            pred_scores_subset: Raw logits for representative anchors,
+                                shape (n_teeth, num_classes).
+
+        Returns:
+            Differentiable duplicate loss scalar.
+
+        Note:
+            The matching step is non-differentiable (uses detached probabilities),
+            but the loss computation uses the original tensor for gradient flow.
+
+        References:
+            Carion, N., et al. (2020). "End-to-End Object Detection with
+            Transformers." ECCV 2020.
+        """
+        n_teeth = pred_scores_subset.shape[0]
+        n_classes = self.nc  # 32 for dental
+        device = pred_scores_subset.device
+        dtype = pred_scores_subset.dtype
+
+        # Edge case: no teeth or single tooth
+        if n_teeth < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Step 1: Convert logits to probabilities
+        probs = pred_scores_subset.softmax(dim=-1)  # (n_teeth, n_classes)
+
+        # Step 2: Build cost matrix (negative probability = lower cost for better match)
+        # IMPORTANT: Detach to prevent gradients through the discrete matching step
+        # Use probabilities (not log-probs) for matching, as recommended in DETR paper
+        cost_cls = -probs.detach().cpu().numpy()  # (n_teeth, n_classes)
+
+        # Step 3: Pad to square matrix if needed
+        # Hungarian algorithm requires square matrix for optimal assignment
+        if n_teeth < n_classes:
+            # More classes than detections: pad rows (dummy detections)
+            # Dummy rows have zero cost (unassigned classes = missing teeth, no penalty)
+            padding = np.zeros((n_classes - n_teeth, n_classes))
+            cost_matrix = np.vstack([cost_cls, padding])
+        elif n_teeth > n_classes:
+            # More detections than classes: pad columns (extra "no class" slots)
+            # This shouldn't happen often in dental (max 32 teeth), but handle it
+            padding = np.zeros((n_teeth, n_teeth - n_classes))
+            cost_matrix = np.hstack([cost_cls, padding])
+        else:
+            cost_matrix = cost_cls
+
+        # Step 4: Hungarian algorithm - find optimal 1:1 assignment
+        # Complexity: O(n³) where n = max(n_teeth, n_classes), fast for n≤32
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        # Step 5: Filter to valid assignments only (exclude dummy rows/cols)
+        valid_mask = (row_ind < n_teeth) & (col_ind < n_classes)
+        det_indices = row_ind[valid_mask]
+        class_indices = col_ind[valid_mask]
+
+        # Edge case: no valid assignments (shouldn't happen, but be safe)
+        if len(det_indices) == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Step 6: Convert to tensors for differentiable loss computation
+        det_indices_t = torch.tensor(det_indices, device=device, dtype=torch.long)
+        class_indices_t = torch.tensor(class_indices, device=device, dtype=torch.long)
+
+        # Step 7: Compute differentiable loss (cross-entropy on assigned pairs)
+        # Get probabilities for assigned (detection, class) pairs
+        assigned_probs = probs[det_indices_t, class_indices_t]  # (n_matched,)
+
+        # Negative log-likelihood (cross-entropy)
+        # This is differentiable - gradients flow through probs back to logits
+        loss = -torch.log(assigned_probs + 1e-8).mean()
 
         return loss
 
