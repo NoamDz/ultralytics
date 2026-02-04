@@ -325,6 +325,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         #                Reference: Carion et al., ECCV 2020
         self.duplicate_loss_type = getattr(self.hyp, "duplicate_loss_type", "hungarian")
 
+        # Anatomy loss type options:
+        # - "components": Use separate duplicate loss + neighbor loss (DEFAULT, current behavior)
+        # - "ordered": Use ordered assignment loss only (replaces both duplicate and neighbor)
+        #              Orders anchors by GT class FDI position, finds optimal monotonic assignment
+        #              Combines uniqueness (like Hungarian) with ordering constraint
+        self.anatomy_loss_type = getattr(self.hyp, "anatomy_loss_type", "components")
+
         # Build FDI mappings
         self._build_fdi_tensors()
 
@@ -1003,50 +1010,60 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             # target_scores has soft labels where argmax = GT class
             gt_classes_subset = target_scores[i, rep_anchor].argmax(dim=-1)  # (n_teeth,)
 
-            # Compute loss components
-            # Duplicate loss: enforces unique class predictions
-            if self.duplicate_loss_type == "hungarian":
-                # DETR-style bipartite matching (Carion et al., ECCV 2020)
-                dup_loss = self._duplicate_loss_hungarian(pred_scores_subset)
-            elif self.duplicate_loss_type == "pairwise":
-                # Pairwise contrastive loss
-                dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
-            elif self.duplicate_loss_type == "soft":
-                # Sum-based soft loss
-                dup_loss = self._duplicate_loss_soft(pred_scores_subset)
-            else:
-                # Disabled (for ablation studies)
-                dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
-
-            # Neighbor loss: choose between GT-conditioned and soft (original)
-            if self.neighbor_gt_conditioned:
-                # GT-conditioned: uses GT neighbor class (found to hurt performance)
-                neighbor_loss = self._neighbor_loss_gt_conditioned(
-                    pred_scores_subset, bboxes, gt_classes_subset
+            # Compute loss based on anatomy_loss_type
+            if self.anatomy_loss_type == "ordered":
+                # Ordered assignment loss: complete anatomical loss
+                # Combines uniqueness (like Hungarian) with ordering constraint
+                # Replaces both duplicate loss and neighbor loss
+                anatomy_loss_value = self._ordered_assignment_loss(
+                    pred_scores_subset, gt_classes_subset
                 )
+                total_loss = total_loss + anatomy_loss_value
             else:
-                # Soft neighbor loss (original implementation)
-                # Uses joint probability of invalid neighbor pairs
-                neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
+                # Components mode (default): separate duplicate + neighbor losses
+                # Duplicate loss: enforces unique class predictions
+                if self.duplicate_loss_type == "hungarian":
+                    # DETR-style bipartite matching (Carion et al., ECCV 2020)
+                    dup_loss = self._duplicate_loss_hungarian(pred_scores_subset)
+                elif self.duplicate_loss_type == "pairwise":
+                    # Pairwise contrastive loss
+                    dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
+                elif self.duplicate_loss_type == "soft":
+                    # Sum-based soft loss
+                    dup_loss = self._duplicate_loss_soft(pred_scores_subset)
+                else:
+                    # Disabled (for ablation studies)
+                    dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
-            # Ordering loss (currently disabled - uses hard class assignments)
-            ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
+                # Neighbor loss: choose between GT-conditioned and soft (original)
+                if self.neighbor_gt_conditioned:
+                    # GT-conditioned: uses GT neighbor class (found to hurt performance)
+                    neighbor_loss = self._neighbor_loss_gt_conditioned(
+                        pred_scores_subset, bboxes, gt_classes_subset
+                    )
+                else:
+                    # Soft neighbor loss (original implementation)
+                    # Uses joint probability of invalid neighbor pairs
+                    neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
 
-            # Apply three-phase weight multiplier to neighbor loss
-            # This implements late-stage focus: suppressed early, full force late
-            neighbor_multiplier = self._get_neighbor_multiplier()
+                # Ordering loss (currently disabled - uses hard class assignments)
+                ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
-            # Log raw loss before multiplier (for monitoring)
-            if self._neighbor_log_enabled:
-                self._neighbor_log["raw_loss_sum"] += neighbor_loss.detach().item()
-                self._neighbor_log["count"] += 1
+                # Apply three-phase weight multiplier to neighbor loss
+                # This implements late-stage focus: suppressed early, full force late
+                neighbor_multiplier = self._get_neighbor_multiplier()
 
-            neighbor_loss = neighbor_loss * neighbor_multiplier
+                # Log raw loss before multiplier (for monitoring)
+                if self._neighbor_log_enabled:
+                    self._neighbor_log["raw_loss_sum"] += neighbor_loss.detach().item()
+                    self._neighbor_log["count"] += 1
 
-            # Note: sqrt normalization removed for margin loss since _neighbor_loss_margin
-            # already returns mean() over all pairs (proper normalization).
-            # Legacy losses (dup_loss, ordering_loss) would need sqrt normalization if re-enabled.
-            total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss)
+                neighbor_loss = neighbor_loss * neighbor_multiplier
+
+                # Note: sqrt normalization removed for margin loss since _neighbor_loss_margin
+                # already returns mean() over all pairs (proper normalization).
+                # Legacy losses (dup_loss, ordering_loss) would need sqrt normalization if re-enabled.
+                total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss)
             valid_count = valid_count + 1.0
 
         # Periodic logging of neighbor loss statistics
@@ -1250,6 +1267,155 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         # Negative log-likelihood (cross-entropy)
         # This is differentiable - gradients flow through probs back to logits
+        loss = -torch.log(assigned_probs + 1e-8).mean()
+
+        return loss
+
+    def _ordered_assignment_loss(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Ordered assignment loss using dynamic programming.
+
+        This loss extends Hungarian matching by adding an ordering constraint:
+        anchors must be assigned classes in monotonically increasing FDI position,
+        following the order defined by their GT classes.
+
+        This approach:
+        1. Orders anchors by their GT class FDI position (avoids x-coordinate issues)
+        2. Uses DP to find optimal unique assignment with monotonicity constraint
+        3. Computes cross-entropy loss on the found assignment
+
+        Key advantages over Hungarian:
+        - Enforces anatomical ordering (teeth should appear in order)
+        - Avoids relying on x-coordinates (which can have ties/noise)
+        - Avoids requiring jaw separation heuristics
+        - Prevents "swap" errors where predictions are unique but misordered
+
+        Args:
+            pred_scores_subset: Raw logits for representative anchors,
+                                shape (n_teeth, num_classes).
+            gt_classes: GT class indices for each anchor, shape (n_teeth,).
+
+        Returns:
+            Differentiable ordered assignment loss scalar.
+
+        References:
+            Mensch, A. & Blondel, M. (2018). "Differentiable Dynamic Programming
+            for Structured Prediction and Attention." ICML 2018.
+        """
+        n_teeth = pred_scores_subset.shape[0]
+        n_classes = self.nc  # 32 for dental
+        device = pred_scores_subset.device
+        dtype = pred_scores_subset.dtype
+
+        # Edge case: less than 2 teeth
+        if n_teeth < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Step 1: Order anchors by GT class FDI position
+        # The class index (0-31) directly corresponds to FDI linear position
+        # Q1: 0-7, Q2: 8-15, Q3: 16-23, Q4: 24-31
+        sort_idx = gt_classes.argsort()
+        ordered_preds = pred_scores_subset[sort_idx]  # (n_teeth, n_classes)
+        ordered_gt = gt_classes[sort_idx]  # For reference (already sorted)
+
+        # Step 2: Compute log probabilities
+        log_probs = F.log_softmax(ordered_preds, dim=-1)  # (n_teeth, n_classes)
+
+        # Step 3: Dynamic Programming to find optimal ordered assignment
+        # V[i, c] = max log-probability of assigning anchors 0..i
+        #           with anchor i assigned to class c
+        #           and all assignments unique and monotonically increasing
+        #
+        # Recurrence: V[i, c] = max(V[i-1, c'] for c' < c) + log_prob[i, c]
+        # This ensures: if anchor i is assigned class c, anchor i-1 must be < c
+
+        NEG_INF = -1e9
+
+        # Initialize DP table and backpointer table
+        V = torch.full((n_teeth, n_classes), NEG_INF, device=device, dtype=dtype)
+        backptr = torch.zeros((n_teeth, n_classes), device=device, dtype=torch.long)
+
+        # Base case: first anchor can be assigned any class (starting from class i to ensure room)
+        # To guarantee we can fit n_teeth unique classes, first anchor needs class >= 0
+        # and last anchor needs class <= n_classes - 1
+        # Minimum spread needed: n_teeth classes
+        min_start = 0
+        max_end = n_classes - 1
+
+        # For first anchor, valid classes are [0, n_classes - n_teeth + 1)
+        # to leave room for remaining n_teeth-1 anchors
+        max_first_class = n_classes - n_teeth
+        V[0, :max_first_class + 1] = log_probs[0, :max_first_class + 1]
+
+        # Fill DP table with backpointers
+        for i in range(1, n_teeth):
+            # Remaining anchors after this one
+            remaining = n_teeth - 1 - i
+            # Maximum class for this anchor (leave room for remaining)
+            max_class_i = n_classes - 1 - remaining
+
+            # Compute cumulative max of previous row with argmax tracking
+            prev_row = V[i - 1, :]
+            cummax_val = torch.full((n_classes,), NEG_INF, device=device, dtype=dtype)
+            cummax_idx = torch.zeros(n_classes, device=device, dtype=torch.long)
+
+            running_max = NEG_INF
+            running_idx = 0
+            for c in range(n_classes):
+                if c > 0:
+                    cummax_val[c] = running_max
+                    cummax_idx[c] = running_idx
+                if prev_row[c] > running_max:
+                    running_max = prev_row[c]
+                    running_idx = c
+
+            # V[i, c] = cummax_val[c] + log_prob[i, c] for valid classes
+            # Only fill up to max_class_i
+            for c in range(1, max_class_i + 1):
+                V[i, c] = cummax_val[c] + log_probs[i, c]
+                backptr[i, c] = cummax_idx[c]
+
+        # Step 4: Backtrack to find optimal assignment
+        assignment = torch.zeros(n_teeth, device=device, dtype=torch.long)
+
+        # Handle edge case: more detections than classes
+        if n_teeth > n_classes:
+            # Can't have unique monotonic assignment, fall back to simple assignment
+            # Assign classes 0, 1, 2, ..., n_classes-1, 0, 1, ... (with duplicates)
+            for i in range(n_teeth):
+                assignment[i] = min(i, n_classes - 1)
+        else:
+            # Find best final class (must be >= n_teeth - 1 to have valid sequence)
+            min_final_class = n_teeth - 1
+            valid_final = V[n_teeth - 1, min_final_class:]
+
+            if valid_final.numel() > 0 and valid_final.max() > NEG_INF:
+                best_final = min_final_class + valid_final.argmax()
+            else:
+                # Fallback: use best available from entire row
+                best_final = V[n_teeth - 1, :].argmax()
+
+            assignment[n_teeth - 1] = best_final
+
+            # Backtrack using backpointers
+            current_class = best_final.item()
+            for i in range(n_teeth - 2, -1, -1):
+                prev_class = backptr[i + 1, current_class].item()
+                assignment[i] = prev_class
+                current_class = prev_class
+
+        # Step 5: Compute loss - CE between predictions and DP assignment
+        # Reorder assignment back to original anchor order
+        inverse_sort = sort_idx.argsort()
+        original_order_assignment = assignment[inverse_sort]
+
+        # Cross-entropy loss
+        probs = pred_scores_subset.softmax(dim=-1)
+        assigned_probs = probs[torch.arange(n_teeth, device=device), original_order_assignment]
         loss = -torch.log(assigned_probs + 1e-8).mean()
 
         return loss
