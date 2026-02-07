@@ -296,6 +296,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     ORDINAL_ADJ_QUAD_BASE = 4   # Base distance for adjacent quadrants (midline/vertical)
     ORDINAL_OPP_QUAD_BASE = 8   # Base distance for opposite quadrants (Q1-Q3, Q2-Q4)
 
+    # Distance Regularization (DR) Loss parameters (Chung et al., 2021)
+    # Empirically determined from validation dataset analysis
+    DR_UPPER_MIDLINE_GAP = 1.18  # Upper midline is WIDER than baseline (92.80/78.95)
+    DR_LOWER_MIDLINE_GAP = 0.63  # Lower midline is NARROWER than baseline (49.54/78.95)
+    DR_MIN_TEETH_PER_SEGMENT = 4  # Minimum teeth for Laplacian (need 3 distances → 1 value)
+
     def __init__(self, model):
         """
         Initialize DentalSegmentationLoss.
@@ -438,6 +444,18 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         if self.ordinal_alpha > 0:
             self._build_distance_matrix()
 
+        # Distance Regularization (DR) Loss (Chung et al., 2021)
+        # Enforces smooth inter-tooth spacing via Laplacian regularization
+        # Set dr > 0 in config to enable (e.g., dr: 0.1)
+        self.dr_weight = getattr(self.hyp, "dr", 0.0)
+        self.dr_enabled = self.dr_weight > 0
+
+        # Always build spatial position lookup (needed by CRF loss and optionally DR loss)
+        self._build_dr_linear_position_lookup()
+
+        # CRF spatial loss constants (precomputed once)
+        self._build_crf_constants()
+
     def _build_fdi_tensors(self):
         """Build FDI lookup tensors for GPU efficiency."""
         # FDI codes tensor for direct lookup
@@ -548,6 +566,255 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                         distance[i, j] = self.ORDINAL_OPP_QUAD_BASE + pos_diff
 
         self.class_distance_matrix = distance
+
+    def _build_dr_linear_position_lookup(self):
+        """
+        Precompute mapping from class index (0-31) to linear position (0-15).
+
+        Linear position represents left-to-right order in panoramic X-ray,
+        separately for upper (0-15) and lower (0-15) rows.
+
+        Layout:
+            Upper: 18(0) 17(1) ... 11(7) | 21(8) 22(9) ... 28(15)
+            Lower: 48(0) 47(1) ... 41(7) | 31(8) 32(9) ... 38(15)
+        """
+        linear_positions = torch.zeros(32, dtype=torch.float32, device=self.device)
+
+        for idx, fdi in enumerate(self.FDI_CLASSES):
+            quadrant = fdi // 10
+            position = fdi % 10
+
+            if quadrant == 1:  # Upper right: 18→0, 17→1, ..., 11→7
+                linear_positions[idx] = 8 - position
+            elif quadrant == 2:  # Upper left: 21→8, 22→9, ..., 28→15
+                linear_positions[idx] = 7 + position
+            elif quadrant == 4:  # Lower right: 48→0, 47→1, ..., 41→7
+                linear_positions[idx] = 8 - position
+            elif quadrant == 3:  # Lower left: 31→8, 32→9, ..., 38→15
+                linear_positions[idx] = 7 + position
+
+        self.dr_linear_position_lookup = linear_positions
+
+    def _build_crf_constants(self):
+        """
+        Precompute constants for CRF spatial loss.
+
+        Builds:
+        - spatial_to_class mappings: for each jaw, maps spatial position (0-15) to class index
+        - crf_transition: (16, 16) matrix encoding strict monotonicity constraint
+        """
+        C = 16  # spatial positions per jaw
+
+        # Build spatial_to_class by inverting dr_linear_position_lookup per jaw
+        # Upper jaw: class indices 0-15
+        spatial_to_class_upper = torch.zeros(C, dtype=torch.long, device=self.device)
+        for cls_idx in range(16):
+            sp = int(self.dr_linear_position_lookup[cls_idx].item())
+            spatial_to_class_upper[sp] = cls_idx
+
+        # Lower jaw: class indices 16-31
+        spatial_to_class_lower = torch.zeros(C, dtype=torch.long, device=self.device)
+        for cls_idx in range(16, 32):
+            sp = int(self.dr_linear_position_lookup[cls_idx].item())
+            spatial_to_class_lower[sp] = cls_idx
+
+        self.spatial_to_class_upper = spatial_to_class_upper
+        self.spatial_to_class_lower = spatial_to_class_lower
+
+        # Transition matrix: T[k, j] = 0 if k < j (valid), -1e9 if k >= j (invalid)
+        # Encodes strict monotonicity: next position must be greater than current
+        # Uses -1e9 instead of -inf to avoid NaN gradients in logsumexp backward pass
+        # (when all inputs are -inf, logsumexp gradient is NaN, and 0*NaN=NaN in torch.where)
+        T = torch.full((C, C), -1e9, device=self.device)
+        mask = torch.triu(torch.ones(C, C, device=self.device), diagonal=1).bool()
+        T[mask] = 0.0
+        self.crf_transition = T
+
+    def _dr_compute_effective_gaps(
+        self,
+        sorted_pos: torch.Tensor,
+        is_upper_jaw: bool,
+    ) -> torch.Tensor:
+        """
+        Compute effective gaps between consecutive positions for DR loss.
+
+        Handles midline crossing with jaw-specific factors determined empirically:
+        - Upper midline (11↔21): 1.18x baseline (wider gap)
+        - Lower midline (31↔41): 0.63x baseline (narrower/crowded)
+
+        Args:
+            sorted_pos: (m,) linear positions sorted left-to-right
+            is_upper_jaw: True for upper jaw, False for lower
+
+        Returns:
+            (m-1,) tensor of effective gaps between consecutive teeth
+        """
+        m = sorted_pos.shape[0]
+        device = sorted_pos.device
+        dtype = sorted_pos.dtype
+
+        gaps = torch.zeros(m - 1, device=device, dtype=dtype)
+        midline_gap = self.DR_UPPER_MIDLINE_GAP if is_upper_jaw else self.DR_LOWER_MIDLINE_GAP
+
+        for i in range(m - 1):
+            pos_a = sorted_pos[i].item()
+            pos_b = sorted_pos[i + 1].item()
+
+            min_pos, max_pos = min(pos_a, pos_b), max(pos_a, pos_b)
+
+            # Check if crosses midline (position 7 to 8)
+            if min_pos <= 7 < max_pos:
+                # Crosses midline: split into components
+                left_part = 7 - min_pos  # slots from min_pos to position 7
+                right_part = max_pos - 8  # slots from position 8 to max_pos
+                gaps[i] = left_part + midline_gap + right_part
+            else:
+                # Same side of midline: simple difference
+                gaps[i] = max_pos - min_pos
+
+        return gaps
+
+    def _dr_row_loss(
+        self,
+        centers: torch.Tensor,
+        linear_pos: torch.Tensor,
+        is_upper_jaw: bool,
+    ) -> torch.Tensor:
+        """
+        Compute Distance Regularization loss for a single row (upper or lower).
+
+        Implements Laplacian regularization on gap-normalized inter-tooth distances.
+        The Laplacian (second derivative) measures "bumpiness" in the distance sequence
+        and should be near zero for evenly spaced teeth.
+
+        Formula: L_dr = mean(∇²d)² where ∇²d[i] = d[i+1] - 2·d[i] + d[i-1]
+
+        Args:
+            centers: (m, 2) bbox centers for teeth in this row
+            linear_pos: (m,) linear positions (0-15)
+            is_upper_jaw: True for upper jaw, False for lower
+
+        Returns:
+            Scalar DR loss for this row.
+        """
+        m = centers.shape[0]
+        device = centers.device
+        dtype = centers.dtype
+
+        # Need at least 4 teeth to compute Laplacian (3 distances → 1 Laplacian value)
+        if m < self.DR_MIN_TEETH_PER_SEGMENT:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Sort detections by linear position (left to right in image)
+        sort_idx = linear_pos.argsort()
+        sorted_centers = centers[sort_idx]
+        sorted_pos = linear_pos[sort_idx]
+
+        # Compute Euclidean distances between consecutive detections
+        diffs = sorted_centers[1:] - sorted_centers[:-1]  # (m-1, 2)
+        distances = torch.norm(diffs, dim=1)  # (m-1,)
+
+        # Compute effective gaps with midline handling
+        effective_gaps = self._dr_compute_effective_gaps(sorted_pos, is_upper_jaw)
+
+        # Normalize distances by effective gap to handle missing teeth
+        # This makes d(11,13)/2 comparable to d(13,14)/1
+        normalized_distances = distances / effective_gaps.clamp(min=0.5)
+
+        # Compute Laplacian (second derivative of distance sequence)
+        # L[i] = d[i+1] - 2*d[i] + d[i-1]
+        # Measures "bumpiness" - should be near zero for evenly spaced teeth
+        laplacian = (
+            normalized_distances[2:]
+            - 2.0 * normalized_distances[1:-1]
+            + normalized_distances[:-2]
+        )
+
+        if laplacian.numel() == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # L2 regularization of Laplacian (squared mean)
+        dr_loss = (laplacian**2).mean()
+
+        return dr_loss
+
+    def _distance_regularization_loss(
+        self,
+        pred_bboxes: torch.Tensor,
+        gt_classes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Distance Regularization (DR) loss adapted for YOLO.
+
+        Enforces smooth spacing between detected teeth by penalizing
+        irregular inter-tooth distances via Laplacian regularization.
+
+        Based on: Chung et al., "Individual Tooth Detection and Identification
+        from Dental Panoramic X-Ray Images via Point-wise Localization and
+        Distance Regularization", Artificial Intelligence in Medicine, 2021.
+
+        Adaptations for YOLO:
+        1. Uses GT class assignment to order detections by FDI position
+        2. Normalizes distances by effective gap to handle missing teeth
+        3. Processes upper and lower jaws separately
+        4. Uses empirically-determined midline factors (upper: 1.18, lower: 0.63)
+
+        Args:
+            pred_bboxes: (n_teeth, 4) predicted bboxes (x1, y1, x2, y2)
+            gt_classes: (n_teeth,) GT class indices (0-31)
+
+        Returns:
+            Scalar DR loss value.
+        """
+        n = pred_bboxes.shape[0]
+        device = pred_bboxes.device
+        dtype = pred_bboxes.dtype
+
+        # Need minimum teeth for meaningful DR loss
+        if n < self.DR_MIN_TEETH_PER_SEGMENT:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Compute bbox centers
+        centers = (pred_bboxes[:, :2] + pred_bboxes[:, 2:4]) / 2
+
+        # Get linear positions from precomputed lookup
+        gt_classes_long = gt_classes.long()
+        linear_pos = self.dr_linear_position_lookup[gt_classes_long]
+
+        # Separate upper and lower jaws using precomputed masks
+        upper_mask = self.upper_jaw_mask[gt_classes_long]
+        lower_mask = self.lower_jaw_mask[gt_classes_long]
+
+        loss = torch.tensor(0.0, device=device, dtype=dtype)
+        count = 0
+
+        # Process upper jaw
+        n_upper = upper_mask.sum()
+        if n_upper >= self.DR_MIN_TEETH_PER_SEGMENT:
+            upper_loss = self._dr_row_loss(
+                centers[upper_mask],
+                linear_pos[upper_mask],
+                is_upper_jaw=True,
+            )
+            loss = loss + upper_loss
+            count += 1
+
+        # Process lower jaw
+        n_lower = lower_mask.sum()
+        if n_lower >= self.DR_MIN_TEETH_PER_SEGMENT:
+            lower_loss = self._dr_row_loss(
+                centers[lower_mask],
+                linear_pos[lower_mask],
+                is_upper_jaw=False,
+            )
+            loss = loss + lower_loss
+            count += 1
+
+        # Average over jaws (if both have enough teeth)
+        if count > 0:
+            loss = loss / count
+
+        return loss
 
     @staticmethod
     def _same_jaw_static(q1: int, q2: int) -> bool:
@@ -1012,14 +1279,22 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
             # Compute loss based on anatomy_loss_type
             if self.anatomy_loss_type == "ordered":
-                # Ordered assignment loss: complete anatomical loss
-                # Combines uniqueness (like Hungarian) with ordering constraint
-                # Replaces both duplicate loss and neighbor loss
-                anatomy_loss_value = self._ordered_assignment_loss(
+                # CRF spatial loss: differentiable structured loss for anatomical ordering
+                # Uses forward DP with LogSumExp to compute partition function over ALL
+                # valid monotonic orderings. Gradient = marginals - GT indicator,
+                # always pushes toward GT. No gradient competition with BCE.
+                anatomy_loss_value = self._crf_spatial_loss(
                     pred_scores_subset, gt_classes_subset
                 )
                 total_loss = total_loss + anatomy_loss_value
-            else:
+
+            # Distance Regularization (DR) Loss - independent, can be combined with any anatomy loss
+            # Enforces smooth inter-tooth spacing via Laplacian regularization
+            if self.dr_enabled:
+                dr_loss = self._distance_regularization_loss(bboxes, gt_classes_subset)
+                total_loss = total_loss + self.dr_weight * dr_loss
+
+            if self.anatomy_loss_type != "ordered":
                 # Components mode (default): separate duplicate + neighbor losses
                 # Duplicate loss: enforces unique class predictions
                 if self.duplicate_loss_type == "hungarian":
@@ -1417,6 +1692,143 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         probs = pred_scores_subset.softmax(dim=-1)
         assigned_probs = probs[torch.arange(n_teeth, device=device), original_order_assignment]
         loss = -torch.log(assigned_probs + 1e-8).mean()
+
+        return loss
+
+    def _crf_spatial_loss(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes_subset: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        CRF spatial loss using differentiable forward DP.
+
+        Instead of finding a hard assignment and computing CE (like _ordered_assignment_loss),
+        this computes a proper CRF loss: L = -score(GT_path) + log Z, where Z is the partition
+        function over ALL valid monotonically increasing spatial orderings.
+
+        The gradient is automatically M[i,j] - 1{j=gt_pos[i]} (marginals minus GT indicator),
+        which ALWAYS pushes toward GT. No feedback loop, no detaching needed.
+
+        Operates per-jaw (upper/lower independently) using correct spatial position ordering.
+
+        Args:
+            pred_scores_subset: Raw logits for representative anchors, shape (n_teeth, 32).
+            gt_classes_subset: GT class indices for each anchor, shape (n_teeth,).
+
+        Returns:
+            Differentiable CRF spatial loss scalar.
+
+        References:
+            Lafferty, McCallum & Pereira (2001). "Conditional Random Fields."
+            Sutton & McCallum (2012). "An Introduction to Conditional Random Fields."
+        """
+        device = pred_scores_subset.device
+        dtype = pred_scores_subset.dtype
+
+        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        total_teeth = 0
+
+        # Ensure precomputed tensors are on the correct device
+        s2c_upper = self.spatial_to_class_upper.to(device)
+        s2c_lower = self.spatial_to_class_lower.to(device)
+
+        # Process each jaw independently
+        # Upper jaw = class indices 0-15, Lower jaw = class indices 16-31
+        for jaw_mask, spatial_to_class in [
+            (gt_classes_subset < 16, s2c_upper),
+            (gt_classes_subset >= 16, s2c_lower),
+        ]:
+            jaw_indices = jaw_mask.nonzero(as_tuple=False).squeeze(1)
+            n_jaw = jaw_indices.numel()
+            if n_jaw < 2:
+                continue
+
+            jaw_logits = pred_scores_subset[jaw_indices]  # (N_jaw, 32)
+            jaw_gt = gt_classes_subset[jaw_indices]  # (N_jaw,)
+
+            jaw_loss = self._crf_forward_dp(jaw_logits, jaw_gt, spatial_to_class)
+            total_loss = total_loss + jaw_loss * n_jaw
+            total_teeth += n_jaw
+
+        if total_teeth == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        return total_loss / total_teeth
+
+    def _crf_forward_dp(
+        self,
+        logits: torch.Tensor,
+        gt_classes: torch.Tensor,
+        spatial_to_class: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward DP for CRF loss on a single jaw.
+
+        Args:
+            logits: Raw logits, shape (N, 32).
+            gt_classes: GT class indices, shape (N,).
+            spatial_to_class: Mapping from spatial position to class index, shape (16,).
+
+        Returns:
+            CRF loss scalar (normalized by N).
+        """
+        device = logits.device
+        dtype = logits.dtype
+        C = 16  # spatial positions per jaw
+        N = logits.shape[0]
+
+        # Sort detections by GT spatial position (left-to-right in panoramic X-ray)
+        pos_lookup = self.dr_linear_position_lookup.to(device)
+        gt_spatial = pos_lookup[gt_classes].long()  # (N,)
+        sort_idx = gt_spatial.argsort()
+        sorted_logits = logits[sort_idx]  # (N, 32)
+        gt_sp_sorted = gt_spatial[sort_idx]  # (N,) strictly increasing
+
+        # Remap logits to spatial position space: S[i, j] = logit for class at position j
+        S = sorted_logits[:, spatial_to_class]  # (N, C)
+
+        # GT path score: sum of scores at GT spatial positions
+        gt_score = S[torch.arange(N, device=device), gt_sp_sorted].sum()
+
+        # Edge case: N >= C means only one valid monotonic assignment exists
+        # (every position must be used), so log_Z = gt_score and loss = 0
+        if N >= C:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Forward DP with LogSumExp to compute log Z (partition function)
+        # Use large negative finite value instead of -inf to avoid NaN gradients
+        # (logsumexp on all-inf inputs produces NaN gradients; 0 * NaN = NaN in torch.where)
+        NEG_INF = torch.tensor(-1e9, device=device, dtype=dtype)
+
+        T = self.crf_transition.to(device=device, dtype=dtype)  # (C, C), precomputed
+
+        # Base case: detection 0 can be at positions 0..C-N
+        max_start = C - N
+        alpha = NEG_INF.expand(C).clone()
+        alpha[: max_start + 1] = S[0, : max_start + 1]
+
+        # Forward pass
+        for i in range(1, N):
+            # alpha_expanded[k, j] = alpha[k] + T[k, j]
+            # T[k,j] = 0 if k < j, -inf if k >= j
+            # So logsumexp over dim=0 gives logsumexp(alpha[k] for k < j) for each j
+            alpha_expanded = alpha.unsqueeze(1) + T  # (C, C)
+            alpha_new = torch.logsumexp(alpha_expanded, dim=0) + S[i]  # (C,)
+
+            # Feasibility: detection i needs at least i positions before it
+            # and N-1-i positions after it
+            min_pos = i
+            max_pos = C - N + i
+            feasible = torch.zeros(C, dtype=torch.bool, device=device)
+            feasible[min_pos : max_pos + 1] = True
+            alpha = torch.where(feasible, alpha_new, NEG_INF)
+
+        # Partition function: sum over all valid final positions
+        log_Z = torch.logsumexp(alpha, dim=0)
+
+        # CRF loss: negative GT score + log partition function
+        loss = (-gt_score + log_Z) / N
 
         return loss
 
