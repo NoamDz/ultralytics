@@ -339,7 +339,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # - "ordered": Use ordered assignment loss only (replaces both duplicate and neighbor)
         #              Orders anchors by GT class FDI position, finds optimal monotonic assignment
         #              Combines uniqueness (like Hungarian) with ordering constraint
-        self.anatomy_loss_type = getattr(self.hyp, "anatomy_loss_type", "components")
+        self.anatomy_loss_type = getattr(self.hyp, "anatomy_loss_type", "ordered")
 
         # Build FDI mappings
         self._build_fdi_tensors()
