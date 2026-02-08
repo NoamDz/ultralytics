@@ -482,7 +482,14 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        if getattr(self, "end2end", False):
+            return E2EDetectLoss(self)
+        # Check if dental-specific losses are enabled
+        if hasattr(self, "args") and getattr(self.args, "anatomy", 0.0) > 0:
+            from ultralytics.utils.dental_loss import DentalDetectionLoss
+
+            return DentalDetectionLoss(self)
+        return v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):

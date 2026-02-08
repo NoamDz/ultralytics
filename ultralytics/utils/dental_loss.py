@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from ultralytics.utils import LOGGER
-from ultralytics.utils.loss import v8SegmentationLoss
+from ultralytics.utils.loss import v8DetectionLoss, v8SegmentationLoss
 
 
 def compute_signed_distance_map_batch(masks: np.ndarray) -> np.ndarray:
@@ -310,7 +310,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             model: De-parallelized model with hyperparameters.
         """
         super().__init__(model)
+        self._init_dental_components(model)
 
+    def _init_dental_components(self, model):
+        """Initialize dental-specific components (shared by segmentation and detection variants)."""
         # Anatomical constraint parameters
         self.max_gap = 3  # Max position gap for same-quadrant neighbors
         self.midline_threshold = 3  # Max position for cross-quadrant same-jaw neighbors
@@ -452,6 +455,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         # Always build spatial position lookup (needed by CRF loss and optionally DR loss)
         self._build_dr_linear_position_lookup()
+
+        # CRF temperature: prevents emission scores from degenerating when BCE
+        # drives logits to large magnitudes. Without this, CRF loss vanishes by epoch 30-40.
+        # T=5 gives "moderate signal" at typical late-training logit scales (±10-12).
+        # Lower T → weaker signal (T=4 is marginal). Higher T → stronger but noisier.
+        self.crf_temperature = getattr(self.hyp, "crf_temperature", 5.0)
 
         # CRF spatial loss constants (precomputed once)
         self._build_crf_constants()
@@ -597,36 +606,39 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
     def _build_crf_constants(self):
         """
-        Precompute constants for CRF spatial loss.
+        Precompute constants for CRF spatial loss (whole-mouth, C=32).
 
         Builds:
-        - spatial_to_class mappings: for each jaw, maps spatial position (0-15) to class index
-        - crf_transition: (16, 16) matrix encoding strict monotonicity constraint
+        - crf_full_position_lookup: class index (0-31) -> full-mouth spatial position (0-31)
+          Upper jaw positions 0-15 (L-to-R in panoramic), lower jaw positions 16-31 (L-to-R).
+        - spatial_to_class_full: inverse mapping, full-mouth position -> class index
+        - crf_transition_full: (32, 32) matrix encoding strict monotonicity constraint
+
+        Per-jaw spatial ordering is preserved because positions 0-15 (upper) are all
+        strictly less than positions 16-31 (lower), so any monotonically increasing
+        path through {0,...,31} restricts to monotonically increasing subsequences
+        within each jaw.
         """
-        C = 16  # spatial positions per jaw
+        C_full = 32  # full-mouth spatial positions
 
-        # Build spatial_to_class by inverting dr_linear_position_lookup per jaw
-        # Upper jaw: class indices 0-15
-        spatial_to_class_upper = torch.zeros(C, dtype=torch.long, device=self.device)
-        for cls_idx in range(16):
-            sp = int(self.dr_linear_position_lookup[cls_idx].item())
-            spatial_to_class_upper[sp] = cls_idx
+        # Full-mouth position lookup: class -> full-mouth spatial position (0-31)
+        # Upper jaw (classes 0-15): keep per-jaw positions 0-15
+        # Lower jaw (classes 16-31): offset per-jaw positions by 16 -> 16-31
+        self.crf_full_position_lookup = self.dr_linear_position_lookup.clone()
+        self.crf_full_position_lookup[16:] += 16
 
-        # Lower jaw: class indices 16-31
-        spatial_to_class_lower = torch.zeros(C, dtype=torch.long, device=self.device)
-        for cls_idx in range(16, 32):
-            sp = int(self.dr_linear_position_lookup[cls_idx].item())
-            spatial_to_class_lower[sp] = cls_idx
+        # Inverse mapping: full-mouth spatial position -> class index
+        spatial_to_class_full = torch.zeros(C_full, dtype=torch.long, device=self.device)
+        for cls_idx in range(32):
+            sp = int(self.crf_full_position_lookup[cls_idx].item())
+            spatial_to_class_full[sp] = cls_idx
+        self.spatial_to_class_full = spatial_to_class_full
 
-        self.spatial_to_class_upper = spatial_to_class_upper
-        self.spatial_to_class_lower = spatial_to_class_lower
-
-        # Transition matrix: T[k, j] = 0 if k < j (valid), -1e9 if k >= j (invalid)
+        # Transition matrix (32x32): T[k, j] = 0 if k < j (valid), -1e9 if k >= j (invalid)
         # Encodes strict monotonicity: next position must be greater than current
         # Uses -1e9 instead of -inf to avoid NaN gradients in logsumexp backward pass
-        # (when all inputs are -inf, logsumexp gradient is NaN, and 0*NaN=NaN in torch.where)
-        T = torch.full((C, C), -1e9, device=self.device)
-        mask = torch.triu(torch.ones(C, C, device=self.device), diagonal=1).bool()
+        T = torch.full((C_full, C_full), -1e9, device=self.device)
+        mask = torch.triu(torch.ones(C_full, C_full, device=self.device), diagonal=1).bool()
         T[mask] = 0.0
         self.crf_transition = T
 
@@ -1286,7 +1298,9 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 anatomy_loss_value = self._crf_spatial_loss(
                     pred_scores_subset, gt_classes_subset
                 )
-                total_loss = total_loss + anatomy_loss_value
+                # Apply late-stage boost (same as components mode neighbor loss)
+                neighbor_multiplier = self._get_neighbor_multiplier()
+                total_loss = total_loss + anatomy_loss_value * neighbor_multiplier
 
             # Distance Regularization (DR) Loss - independent, can be combined with any anatomy loss
             # Enforces smooth inter-tooth spacing via Laplacian regularization
@@ -1701,16 +1715,17 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         gt_classes_subset: torch.Tensor,
     ) -> torch.Tensor:
         """
-        CRF spatial loss using differentiable forward DP.
+        CRF spatial loss using differentiable forward DP (whole-mouth, C=32).
 
-        Instead of finding a hard assignment and computing CE (like _ordered_assignment_loss),
-        this computes a proper CRF loss: L = -score(GT_path) + log Z, where Z is the partition
-        function over ALL valid monotonically increasing spatial orderings.
+        Computes a proper CRF loss: L = -score(GT_path) + log Z, where Z is the partition
+        function over ALL valid monotonically increasing spatial orderings across all 32
+        tooth positions (upper jaw positions 0-15, lower jaw 16-31).
 
         The gradient is automatically M[i,j] - 1{j=gt_pos[i]} (marginals minus GT indicator),
         which ALWAYS pushes toward GT. No feedback loop, no detaching needed.
 
-        Operates per-jaw (upper/lower independently) using correct spatial position ordering.
+        Per-jaw spatial ordering is preserved: positions 0-15 (upper) < positions 16-31 (lower),
+        so any monotonic path restricts to monotonic subsequences within each jaw.
 
         Args:
             pred_scores_subset: Raw logits for representative anchors, shape (n_teeth, 32).
@@ -1725,36 +1740,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         """
         device = pred_scores_subset.device
         dtype = pred_scores_subset.dtype
+        n_teeth = pred_scores_subset.shape[0]
 
-        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
-        total_teeth = 0
-
-        # Ensure precomputed tensors are on the correct device
-        s2c_upper = self.spatial_to_class_upper.to(device)
-        s2c_lower = self.spatial_to_class_lower.to(device)
-
-        # Process each jaw independently
-        # Upper jaw = class indices 0-15, Lower jaw = class indices 16-31
-        for jaw_mask, spatial_to_class in [
-            (gt_classes_subset < 16, s2c_upper),
-            (gt_classes_subset >= 16, s2c_lower),
-        ]:
-            jaw_indices = jaw_mask.nonzero(as_tuple=False).squeeze(1)
-            n_jaw = jaw_indices.numel()
-            if n_jaw < 2:
-                continue
-
-            jaw_logits = pred_scores_subset[jaw_indices]  # (N_jaw, 32)
-            jaw_gt = gt_classes_subset[jaw_indices]  # (N_jaw,)
-
-            jaw_loss = self._crf_forward_dp(jaw_logits, jaw_gt, spatial_to_class)
-            total_loss = total_loss + jaw_loss * n_jaw
-            total_teeth += n_jaw
-
-        if total_teeth == 0:
+        if n_teeth < 2:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
-        return total_loss / total_teeth
+        s2c_full = self.spatial_to_class_full.to(device)
+        return self._crf_forward_dp(pred_scores_subset, gt_classes_subset, s2c_full)
 
     def _crf_forward_dp(
         self,
@@ -1763,36 +1755,40 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         spatial_to_class: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Forward DP for CRF loss on a single jaw.
+        Forward DP for CRF loss (whole-mouth, C=32).
 
         Args:
             logits: Raw logits, shape (N, 32).
             gt_classes: GT class indices, shape (N,).
-            spatial_to_class: Mapping from spatial position to class index, shape (16,).
+            spatial_to_class: Mapping from spatial position to class index, shape (C,).
 
         Returns:
             CRF loss scalar (normalized by N).
         """
         device = logits.device
         dtype = logits.dtype
-        C = 16  # spatial positions per jaw
+        C = spatial_to_class.shape[0]  # 32 for whole-mouth
         N = logits.shape[0]
 
-        # Sort detections by GT spatial position (left-to-right in panoramic X-ray)
-        pos_lookup = self.dr_linear_position_lookup.to(device)
+        # Sort detections by GT full-mouth spatial position (0-31)
+        # Upper jaw: positions 0-15 (L-to-R), Lower jaw: positions 16-31 (L-to-R)
+        pos_lookup = self.crf_full_position_lookup.to(device)
         gt_spatial = pos_lookup[gt_classes].long()  # (N,)
         sort_idx = gt_spatial.argsort()
         sorted_logits = logits[sort_idx]  # (N, 32)
         gt_sp_sorted = gt_spatial[sort_idx]  # (N,) strictly increasing
 
-        # Remap logits to spatial position space: S[i, j] = logit for class at position j
-        S = sorted_logits[:, spatial_to_class]  # (N, C)
+        # Remap logits to spatial position space with temperature-scaled log_softmax.
+        # Raw logits cause CRF loss to vanish as BCE drives logits to large magnitudes
+        # (e.g., +/-10-15), making the partition function degenerate to a single path.
+        # log_softmax normalizes per-position and temperature controls effective scale.
+        S = F.log_softmax(sorted_logits / self.crf_temperature, dim=-1)[:, spatial_to_class]  # (N, C)
 
         # GT path score: sum of scores at GT spatial positions
         gt_score = S[torch.arange(N, device=device), gt_sp_sorted].sum()
 
-        # Edge case: N >= C means only one valid monotonic assignment exists
-        # (every position must be used), so log_Z = gt_score and loss = 0
+        # Edge case: N >= C (all 32 teeth present) means only one valid path.
+        # Extremely rare (requires all wisdom teeth). Return 0 to avoid degenerate DP.
         if N >= C:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
@@ -2329,3 +2325,110 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         loss = weighted_bce.sum() / target_scores_sum
 
         return loss
+
+
+class DentalDetectionLoss(DentalSegmentationLoss):
+    """Detection-only variant of DentalSegmentationLoss.
+
+    Inherits all dental methods (CRF, anatomy, neighbor, etc.) from DentalSegmentationLoss
+    but uses v8DetectionLoss as the base (no segmentation head required).
+
+    Returns 4 loss components: [box, cls, dfl, anatomy]
+    """
+
+    def __init__(self, model):
+        """Initialize DentalDetectionLoss with detection base + dental components."""
+        # Skip DentalSegmentationLoss/v8SegmentationLoss __init__, go straight to detection
+        v8DetectionLoss.__init__(self, model)
+        self._init_dental_components(model)
+
+    def __call__(self, preds, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate detection loss + anatomy. Returns [box, cls, dfl, anatomy]."""
+        loss = torch.zeros(4, device=self.device)
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+
+        from ultralytics.utils.tal import make_anchors
+
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+
+        # Capture target_gt_idx (v8DetectionLoss discards it)
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+        anatomy_weight = self._get_anatomy_weight()
+
+        # Classification loss (standard or ordinal-weighted)
+        if self.ordinal_alpha > 0:
+            loss[1] = self._ordinal_classification_loss(pred_scores, target_scores, fg_mask)
+        else:
+            loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+
+        # Bbox loss
+        if fg_mask.sum():
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes / stride_tensor,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+            )
+
+            # Anatomy loss
+            if anatomy_weight > 0:
+                if self._timing_enabled:
+                    if self._timing_sync and pred_scores.is_cuda:
+                        torch.cuda.synchronize()
+                    t_start = time.perf_counter()
+                loss[3] = self.compute_anatomy_loss_vectorized(
+                    pred_scores, pred_bboxes * stride_tensor, target_scores, target_gt_idx, fg_mask
+                )
+                if self._timing_enabled:
+                    if self._timing_sync and pred_scores.is_cuda:
+                        torch.cuda.synchronize()
+                    self._timing["anatomy"] += time.perf_counter() - t_start
+
+        # Apply loss weights
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= anatomy_weight  # anatomy gain
+
+        if self._timing_enabled:
+            self._timing["batches"] += 1
+            if self._timing["batches"] % self._timing_every == 0:
+                LOGGER.info(
+                    f"Dental loss timing (last {self._timing_every} batches): "
+                    f"anatomy={self._timing['anatomy']:.3f}s, "
+                    f"sync={self._timing_sync}"
+                )
+                self._timing["anatomy"] = 0.0
+
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, anatomy)
