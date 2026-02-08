@@ -1766,7 +1766,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             CRF loss scalar (normalized by N).
         """
         device = logits.device
-        dtype = logits.dtype
+        # Force float32: CRF uses -1e9 as "practical -inf" which overflows fp16
+        # (fp16 max ≈ 65504), becoming true -inf. In logsumexp backward,
+        # exp(-inf - (-inf)) = exp(NaN) = NaN, which makes GradScaler skip
+        # ALL optimizer steps (not just anatomy), causing total training failure.
+        logits = logits.float()
+        dtype = logits.dtype  # always float32
         C = spatial_to_class.shape[0]  # 32 for whole-mouth
         N = logits.shape[0]
 
