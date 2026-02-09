@@ -287,6 +287,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
     NEIGHBOR_BOOST_END = 80  # Epoch to reach maximum (most effectiveness from here)
     NEIGHBOR_MAX_MULT = 5.0  # Maximum multiplier (reached at BOOST_END, held until end)
 
+    # CRF warmup schedule: let model learn basics first, then introduce CRF
+    # Epochs 0 to CRF_WARMUP_START: multiplier = 0 (no CRF)
+    # Epochs CRF_WARMUP_START to CRF_WARMUP_END: linear ramp 0 → 1.0
+    # Epochs CRF_WARMUP_END to end: multiplier = 1.0 (full force)
+    CRF_WARMUP_START = 30  # Start introducing CRF after model has learned basics
+    CRF_WARMUP_END = 60  # Full CRF force from this epoch onwards
+
     # Adaptive margin parameters
     NEIGHBOR_BASE_MARGIN = 0.3  # Base margin (30% gap requirement)
     NEIGHBOR_MAX_MARGIN = 0.5  # Max margin at final epoch (50% gap)
@@ -913,6 +920,33 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         return float(multiplier)
 
+    def _get_crf_multiplier(self) -> float:
+        """
+        Get warmup multiplier for CRF spatial loss.
+
+        Implements a "learn first, enforce later" schedule:
+        - Epochs 0 to CRF_WARMUP_START: 0.0 (let model learn basics)
+        - CRF_WARMUP_START to CRF_WARMUP_END: linear ramp 0.0 → 1.0
+        - CRF_WARMUP_END to end: 1.0 (full CRF force)
+
+        Returns:
+            float: Multiplier in [0.0, 1.0].
+        """
+        epoch = self.current_epoch
+        warmup_start = self.CRF_WARMUP_START
+        warmup_end = self.CRF_WARMUP_END
+
+        if epoch < warmup_start:
+            return 0.0
+        elif epoch < warmup_end:
+            ramp_duration = warmup_end - warmup_start
+            if ramp_duration <= 0:
+                return 1.0
+            progress = (epoch - warmup_start) / ramp_duration
+            return float(progress)
+        else:
+            return 1.0
+
     def _get_adaptive_margin(self) -> float:
         """
         Get adaptive margin for neighbor loss based on training progress.
@@ -1295,12 +1329,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 # Uses forward DP with LogSumExp to compute partition function over ALL
                 # valid monotonic orderings. Gradient = marginals - GT indicator,
                 # always pushes toward GT. No gradient competition with BCE.
-                anatomy_loss_value = self._crf_spatial_loss(
-                    pred_scores_subset, gt_classes_subset
-                )
-                # Apply late-stage boost (same as components mode neighbor loss)
-                neighbor_multiplier = self._get_neighbor_multiplier()
-                total_loss = total_loss + anatomy_loss_value * neighbor_multiplier
+                crf_multiplier = self._get_crf_multiplier()
+                if crf_multiplier > 0:
+                    anatomy_loss_value = self._crf_spatial_loss(
+                        pred_scores_subset, gt_classes_subset
+                    )
+                    total_loss = total_loss + anatomy_loss_value * crf_multiplier
 
             # Distance Regularization (DR) Loss - independent, can be combined with any anatomy loss
             # Enforces smooth inter-tooth spacing via Laplacian regularization
