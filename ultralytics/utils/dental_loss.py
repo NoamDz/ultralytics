@@ -348,6 +348,11 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         #              Combines uniqueness (like Hungarian) with ordering constraint
         self.anatomy_loss_type = getattr(self.hyp, "anatomy_loss_type", "ordered")
 
+        # Structured hinge loss margin for ordered assignment
+        # Controls how much the GT logit must exceed the DP-assigned logit
+        # Higher margin = stricter enforcement of correct class assignment
+        self.dp_margin = getattr(self.hyp, "dp_margin", 1.0)
+
         # Build FDI mappings
         self._build_fdi_tensors()
 
@@ -1325,16 +1330,15 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
             # Compute loss based on anatomy_loss_type
             if self.anatomy_loss_type == "ordered":
-                # CRF spatial loss: differentiable structured loss for anatomical ordering
-                # Uses forward DP with LogSumExp to compute partition function over ALL
-                # valid monotonic orderings. Gradient = marginals - GT indicator,
-                # always pushes toward GT. No gradient competition with BCE.
-                crf_multiplier = self._get_crf_multiplier()
-                if crf_multiplier > 0:
-                    anatomy_loss_value = self._crf_spatial_loss(
+                # Structured hinge loss with DP-based ordered assignment
+                # Finds optimal monotonic assignment via DP, applies hinge loss
+                # only on violating anchors. Zero loss when ordering is satisfied.
+                ordered_multiplier = self._get_crf_multiplier()
+                if ordered_multiplier > 0:
+                    anatomy_loss_value = self._ordered_assignment_loss(
                         pred_scores_subset, gt_classes_subset
                     )
-                    total_loss = total_loss + anatomy_loss_value * crf_multiplier
+                    total_loss = total_loss + anatomy_loss_value * ordered_multiplier
 
             # Distance Regularization (DR) Loss - independent, can be combined with any anatomy loss
             # Enforces smooth inter-tooth spacing via Laplacian regularization
@@ -1600,22 +1604,20 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         gt_classes: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Ordered assignment loss using dynamic programming.
+        Structured hinge loss with DP-based ordered assignment and violation gating.
 
-        This loss extends Hungarian matching by adding an ordering constraint:
-        anchors must be assigned classes in monotonically increasing FDI position,
-        following the order defined by their GT classes.
+        Finds the optimal monotonic class assignment via dynamic programming in
+        spatial-position space (0-31 whole mouth), then applies a margin-based hinge
+        loss only on anchors where the DP assignment disagrees with GT (violations).
 
-        This approach:
-        1. Orders anchors by their GT class FDI position (avoids x-coordinate issues)
-        2. Uses DP to find optimal unique assignment with monotonicity constraint
-        3. Computes cross-entropy loss on the found assignment
+        Key improvements over previous DP + softmax CE:
+        1. Sorts by spatial position (not class index) — correct for Q1/Q4 reversal
+        2. Violation gating: zero loss when all assignments match GT (no gradient drag)
+        3. Structured hinge: only corrects violations with margin, vanishes when satisfied
 
-        Key advantages over Hungarian:
-        - Enforces anatomical ordering (teeth should appear in order)
-        - Avoids relying on x-coordinates (which can have ties/noise)
-        - Avoids requiring jaw separation heuristics
-        - Prevents "swap" errors where predictions are unique but misordered
+        The hinge loss for each violating anchor:
+            max(0, margin + logit[dp_class] - logit[gt_class])
+        pushes gt_class logit above dp_class logit by at least `margin`.
 
         Args:
             pred_scores_subset: Raw logits for representative anchors,
@@ -1623,123 +1625,100 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             gt_classes: GT class indices for each anchor, shape (n_teeth,).
 
         Returns:
-            Differentiable ordered assignment loss scalar.
-
-        References:
-            Mensch, A. & Blondel, M. (2018). "Differentiable Dynamic Programming
-            for Structured Prediction and Attention." ICML 2018.
+            Differentiable structured hinge loss scalar.
         """
-        n_teeth = pred_scores_subset.shape[0]
-        n_classes = self.nc  # 32 for dental
+        n = pred_scores_subset.shape[0]
         device = pred_scores_subset.device
         dtype = pred_scores_subset.dtype
+        C = 32  # spatial positions (whole mouth)
 
-        # Edge case: less than 2 teeth
-        if n_teeth < 2:
+        if n < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        if n > C:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
-        # Step 1: Order anchors by GT class FDI position
-        # The class index (0-31) directly corresponds to FDI linear position
-        # Q1: 0-7, Q2: 8-15, Q3: 16-23, Q4: 24-31
-        sort_idx = gt_classes.argsort()
-        ordered_preds = pred_scores_subset[sort_idx]  # (n_teeth, n_classes)
-        ordered_gt = gt_classes[sort_idx]  # For reference (already sorted)
+        # --- Step 1: Sort anchors by GT spatial position (not class index!) ---
+        # This fixes the Q1/Q4 reversal bug where class index != spatial order
+        spatial_lookup = self.crf_full_position_lookup.to(device)
+        s2c = self.spatial_to_class_full.to(device)
 
-        # Step 2: Compute log probabilities
-        log_probs = F.log_softmax(ordered_preds, dim=-1)  # (n_teeth, n_classes)
+        gt_spatial = spatial_lookup[gt_classes.long()]  # (n,) GT spatial positions
+        sort_idx = gt_spatial.argsort()
+        ordered_preds = pred_scores_subset[sort_idx]  # (n, 32) logits in spatial order
 
-        # Step 3: Dynamic Programming to find optimal ordered assignment
-        # V[i, c] = max log-probability of assigning anchors 0..i
-        #           with anchor i assigned to class c
-        #           and all assignments unique and monotonically increasing
-        #
-        # Recurrence: V[i, c] = max(V[i-1, c'] for c' < c) + log_prob[i, c]
-        # This ensures: if anchor i is assigned class c, anchor i-1 must be < c
+        # --- Step 2: DP in spatial-position space ---
+        # Remap logits so index = spatial position: emission[i, pos] = logit[i, s2c[pos]]
+        emissions = ordered_preds[:, s2c].float()  # (n, C) float32 for DP stability
 
         NEG_INF = -1e9
+        V = torch.full((n, C), NEG_INF, device=device, dtype=torch.float32)
+        backptr = torch.zeros((n, C), device=device, dtype=torch.long)
 
-        # Initialize DP table and backpointer table
-        V = torch.full((n_teeth, n_classes), NEG_INF, device=device, dtype=dtype)
-        backptr = torch.zeros((n_teeth, n_classes), device=device, dtype=torch.long)
+        # Base case: first anchor can use positions [0, C-n]
+        max_first = C - n
+        V[0, : max_first + 1] = emissions[0, : max_first + 1]
 
-        # Base case: first anchor can be assigned any class (starting from class i to ensure room)
-        # To guarantee we can fit n_teeth unique classes, first anchor needs class >= 0
-        # and last anchor needs class <= n_classes - 1
-        # Minimum spread needed: n_teeth classes
-        min_start = 0
-        max_end = n_classes - 1
+        # Fill DP table
+        for i in range(1, n):
+            remaining = n - 1 - i
+            max_pos_i = C - 1 - remaining
 
-        # For first anchor, valid classes are [0, n_classes - n_teeth + 1)
-        # to leave room for remaining n_teeth-1 anchors
-        max_first_class = n_classes - n_teeth
-        V[0, :max_first_class + 1] = log_probs[0, :max_first_class + 1]
-
-        # Fill DP table with backpointers
-        for i in range(1, n_teeth):
-            # Remaining anchors after this one
-            remaining = n_teeth - 1 - i
-            # Maximum class for this anchor (leave room for remaining)
-            max_class_i = n_classes - 1 - remaining
-
-            # Compute cumulative max of previous row with argmax tracking
-            prev_row = V[i - 1, :]
-            cummax_val = torch.full((n_classes,), NEG_INF, device=device, dtype=dtype)
-            cummax_idx = torch.zeros(n_classes, device=device, dtype=torch.long)
-
+            prev_row = V[i - 1]
             running_max = NEG_INF
             running_idx = 0
-            for c in range(n_classes):
-                if c > 0:
-                    cummax_val[c] = running_max
-                    cummax_idx[c] = running_idx
-                if prev_row[c] > running_max:
-                    running_max = prev_row[c]
-                    running_idx = c
 
-            # V[i, c] = cummax_val[c] + log_prob[i, c] for valid classes
-            # Only fill up to max_class_i
-            for c in range(1, max_class_i + 1):
-                V[i, c] = cummax_val[c] + log_probs[i, c]
-                backptr[i, c] = cummax_idx[c]
+            for p in range(C):
+                # cummax_val_p = max of V[i-1, 0..p-1] (strict: previous pos < current)
+                cummax_val_p = running_max
+                cummax_idx_p = running_idx
 
-        # Step 4: Backtrack to find optimal assignment
-        assignment = torch.zeros(n_teeth, device=device, dtype=torch.long)
+                if prev_row[p].item() > running_max:
+                    running_max = prev_row[p].item()
+                    running_idx = p
 
-        # Handle edge case: more detections than classes
-        if n_teeth > n_classes:
-            # Can't have unique monotonic assignment, fall back to simple assignment
-            # Assign classes 0, 1, 2, ..., n_classes-1, 0, 1, ... (with duplicates)
-            for i in range(n_teeth):
-                assignment[i] = min(i, n_classes - 1)
+                if 1 <= p <= max_pos_i:
+                    V[i, p] = cummax_val_p + emissions[i, p]
+                    backptr[i, p] = cummax_idx_p
+
+        # --- Step 3: Backtrack to find optimal assignment ---
+        min_final = n - 1
+        valid_final = V[n - 1, min_final:]
+
+        if valid_final.numel() > 0 and valid_final.max() > NEG_INF:
+            best_final = min_final + valid_final.argmax()
         else:
-            # Find best final class (must be >= n_teeth - 1 to have valid sequence)
-            min_final_class = n_teeth - 1
-            valid_final = V[n_teeth - 1, min_final_class:]
+            best_final = V[n - 1].argmax()
 
-            if valid_final.numel() > 0 and valid_final.max() > NEG_INF:
-                best_final = min_final_class + valid_final.argmax()
-            else:
-                # Fallback: use best available from entire row
-                best_final = V[n_teeth - 1, :].argmax()
+        assignment_pos = torch.zeros(n, device=device, dtype=torch.long)
+        assignment_pos[n - 1] = best_final
 
-            assignment[n_teeth - 1] = best_final
+        current = best_final.item()
+        for i in range(n - 2, -1, -1):
+            prev = backptr[i + 1, current].item()
+            assignment_pos[i] = prev
+            current = prev
 
-            # Backtrack using backpointers
-            current_class = best_final.item()
-            for i in range(n_teeth - 2, -1, -1):
-                prev_class = backptr[i + 1, current_class].item()
-                assignment[i] = prev_class
-                current_class = prev_class
+        # Convert spatial positions back to class indices
+        dp_classes_sorted = s2c[assignment_pos]
 
-        # Step 5: Compute loss - CE between predictions and DP assignment
-        # Reorder assignment back to original anchor order
+        # Reorder back to original anchor order
         inverse_sort = sort_idx.argsort()
-        original_order_assignment = assignment[inverse_sort]
+        dp_classes = dp_classes_sorted[inverse_sort]
 
-        # Cross-entropy loss
-        probs = pred_scores_subset.softmax(dim=-1)
-        assigned_probs = probs[torch.arange(n_teeth, device=device), original_order_assignment]
-        loss = -torch.log(assigned_probs + 1e-8).mean()
+        # --- Step 4: Violation gating ---
+        # If DP assignment matches GT for all anchors, ordering is already satisfied
+        violations = dp_classes != gt_classes
+        if not violations.any():
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # --- Step 5: Structured hinge loss on violating anchors ---
+        arange = torch.arange(n, device=device)
+        gt_logits = pred_scores_subset[arange, gt_classes.long()]
+        dp_logits = pred_scores_subset[arange, dp_classes.long()]
+
+        # hinge = max(0, margin + dp_logit - gt_logit) for violations only
+        hinge = torch.clamp(self.dp_margin + dp_logits - gt_logits, min=0.0)
+        loss = hinge[violations].mean()
 
         return loss
 
