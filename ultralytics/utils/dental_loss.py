@@ -245,6 +245,43 @@ class AlphaScheduler:
             return min(alpha, self.alpha_max)
 
 
+class _MarginCRFFunction(torch.autograd.Function):
+    """Custom autograd for margin CRF loss with explicit forward-backward marginals."""
+
+    @staticmethod
+    def forward(ctx, emissions, gt_pos_sorted, marginals, raw_loss_val, margin):
+        """
+        Args:
+            emissions: (N, C) requires_grad — the tensor we need gradient for.
+            gt_pos_sorted: (N,) long — sorted GT spatial positions.
+            marginals: (N, C) detached — precomputed from forward-backward.
+            raw_loss_val: scalar — (log_Z - gt_score) / N, detached.
+            margin: float.
+        """
+        loss_val = max(0.0, raw_loss_val.item() - margin)
+        loss = torch.tensor(loss_val, device=emissions.device, dtype=emissions.dtype)
+
+        ctx.save_for_backward(marginals, gt_pos_sorted)
+        ctx.active = loss_val > 0
+        ctx.N = emissions.shape[0]
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if not ctx.active:
+            return (torch.zeros_like(ctx.saved_tensors[0]),) + (None,) * 4
+
+        marginals, gt_pos_sorted = ctx.saved_tensors
+        N = ctx.N
+
+        # Analytical CRF gradient: (marginals - GT_indicator) / N
+        grad = marginals / N
+        arange = torch.arange(N, device=grad.device)
+        grad[arange, gt_pos_sorted.long()] -= 1.0 / N
+
+        return (grad_output * grad,) + (None,) * 4
+
+
 class DentalSegmentationLoss(v8SegmentationLoss):
     """
     Dental-specific segmentation loss extending v8SegmentationLoss.
@@ -347,11 +384,6 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         #              Orders anchors by GT class FDI position, finds optimal monotonic assignment
         #              Combines uniqueness (like Hungarian) with ordering constraint
         self.anatomy_loss_type = getattr(self.hyp, "anatomy_loss_type", "ordered")
-
-        # Structured hinge loss margin for ordered assignment
-        # Controls how much the GT logit must exceed the DP-assigned logit
-        # Higher margin = stricter enforcement of correct class assignment
-        self.dp_margin = getattr(self.hyp, "dp_margin", 1.0)
 
         # Build FDI mappings
         self._build_fdi_tensors()
@@ -473,6 +505,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # T=5 gives "moderate signal" at typical late-training logit scales (±10-12).
         # Lower T → weaker signal (T=4 is marginal). Higher T → stronger but noisier.
         self.crf_temperature = getattr(self.hyp, "crf_temperature", 5.0)
+        self.crf_margin = getattr(self.hyp, "crf_margin", 0.05)
 
         # CRF spatial loss constants (precomputed once)
         self._build_crf_constants()
@@ -1330,15 +1363,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
             # Compute loss based on anatomy_loss_type
             if self.anatomy_loss_type == "ordered":
-                # Structured hinge loss with DP-based ordered assignment
-                # Finds optimal monotonic assignment via DP, applies hinge loss
-                # only on violating anchors. Zero loss when ordering is satisfied.
-                ordered_multiplier = self._get_crf_multiplier()
-                if ordered_multiplier > 0:
-                    anatomy_loss_value = self._ordered_assignment_loss(
-                        pred_scores_subset, gt_classes_subset
-                    )
-                    total_loss = total_loss + anatomy_loss_value * ordered_multiplier
+                # Margin CRF: multi-competitor ordering loss with forward-backward
+                # Zero gradient when GT path dominates by margin (no persistent gradient)
+                anatomy_loss_value = self._crf_spatial_loss(
+                    pred_scores_subset, gt_classes_subset
+                )
+                total_loss = total_loss + anatomy_loss_value
 
             # Distance Regularization (DR) Loss - independent, can be combined with any anatomy loss
             # Enforces smooth inter-tooth spacing via Laplacian regularization
@@ -1722,44 +1752,91 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         return loss
 
+    def _pairwise_ordering_loss(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Pairwise ordering loss based on violation probability between adjacent anchors.
+
+        For each pair of spatially adjacent anchors (sorted by GT spatial position),
+        computes the probability that the left anchor predicts a class at a spatial
+        position >= the right anchor's predicted class — i.e., an ordering violation.
+
+        P(violation) = Σ_{p} left(p) · CDF_right(p)
+
+        where left(p) is the left anchor's probability at spatial position p, and
+        CDF_right(p) = Σ_{q<=p} right(q) is the right anchor's cumulative probability
+        up to position p.
+
+        Key properties:
+        - No GT class target: GT is only used for sorting anchors spatially
+        - No exponential scaling: each pair evaluated independently
+        - Naturally reaches ~0 when predictions are correct and confident
+        - Fully differentiable via softmax → cumsum → products
+
+        Args:
+            pred_scores_subset: Raw logits for representative anchors,
+                                shape (n_teeth, num_classes).
+            gt_classes: GT class indices for each anchor, shape (n_teeth,).
+
+        Returns:
+            Differentiable pairwise ordering loss scalar.
+        """
+        n = pred_scores_subset.shape[0]
+        device = pred_scores_subset.device
+        dtype = pred_scores_subset.dtype
+
+        if n < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Sort anchors by GT spatial position (not class index — fixes Q1/Q4 reversal)
+        spatial_lookup = self.crf_full_position_lookup.to(device)
+        s2c = self.spatial_to_class_full.to(device)
+
+        gt_spatial = spatial_lookup[gt_classes.long()]  # (n,) GT spatial positions
+        sort_idx = gt_spatial.argsort()
+
+        # Softmax probabilities remapped to spatial position order
+        probs = pred_scores_subset[sort_idx].float().softmax(dim=-1)  # (n, 32)
+        spatial_probs = probs[:, s2c]  # (n, 32) index = spatial position
+
+        # Adjacent pairs in spatial order
+        left = spatial_probs[:-1]   # (n-1, 32)
+        right = spatial_probs[1:]   # (n-1, 32)
+
+        # For each pair: P(violation) = Σ_p left(p) · CDF_right(p)
+        # CDF_right(p) = Σ_{q=0}^{p} right(q) = probability right anchor is at position ≤ p
+        # If left is at position p and right is at position ≤ p, that's a violation
+        cum_right = right.cumsum(dim=-1)  # (n-1, 32)
+        pair_violation = (left * cum_right).sum(dim=-1)  # (n-1,)
+
+        return pair_violation.mean()
+
     def _crf_spatial_loss(
         self,
         pred_scores_subset: torch.Tensor,
         gt_classes_subset: torch.Tensor,
     ) -> torch.Tensor:
         """
-        CRF spatial loss using differentiable forward DP (whole-mouth, C=32).
+        Margin CRF spatial loss with forward-backward (whole-mouth, C=32).
 
-        Computes a proper CRF loss: L = -score(GT_path) + log Z, where Z is the partition
+        Computes L = max(0, (-score_GT + log_Z) / N - margin), where Z is the partition
         function over ALL valid monotonically increasing spatial orderings across all 32
-        tooth positions (upper jaw positions 0-15, lower jaw 16-31).
-
-        The gradient is automatically M[i,j] - 1{j=gt_pos[i]} (marginals minus GT indicator),
-        which ALWAYS pushes toward GT. No feedback loop, no detaching needed.
-
-        Per-jaw spatial ordering is preserved: positions 0-15 (upper) < positions 16-31 (lower),
-        so any monotonic path restricts to monotonic subsequences within each jaw.
+        tooth positions. Uses explicit forward-backward for numerically stable marginals.
 
         Args:
             pred_scores_subset: Raw logits for representative anchors, shape (n_teeth, 32).
             gt_classes_subset: GT class indices for each anchor, shape (n_teeth,).
 
         Returns:
-            Differentiable CRF spatial loss scalar.
-
-        References:
-            Lafferty, McCallum & Pereira (2001). "Conditional Random Fields."
-            Sutton & McCallum (2012). "An Introduction to Conditional Random Fields."
+            Margin CRF spatial loss scalar.
         """
-        device = pred_scores_subset.device
-        dtype = pred_scores_subset.dtype
         n_teeth = pred_scores_subset.shape[0]
-
         if n_teeth < 2:
-            return torch.tensor(0.0, device=device, dtype=dtype)
-
-        s2c_full = self.spatial_to_class_full.to(device)
-        return self._crf_forward_dp(pred_scores_subset, gt_classes_subset, s2c_full)
+            return torch.tensor(0.0, device=pred_scores_subset.device, dtype=pred_scores_subset.dtype)
+        return self._margin_crf_loss(pred_scores_subset, gt_classes_subset)
 
     def _crf_forward_dp(
         self,
@@ -1844,6 +1921,116 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # CRF loss: negative GT score + log partition function
         loss = (-gt_score + log_Z) / N
 
+        return loss
+
+    def _crf_backward(self, S, N, C, T, NEG_INF):
+        """
+        Backward algorithm for CRF.
+
+        Computes beta[i, p] = logsumexp over q > p of (S[i+1, q] + beta[i+1, q]).
+
+        Args:
+            S: Emissions (N, C) in spatial position space, float32.
+            N: Number of anchors.
+            C: Number of spatial positions (32).
+            T: Transition matrix (C, C), T[p,q] = 0 if p < q, -1e9 otherwise.
+            NEG_INF: Sentinel value (-1e9).
+
+        Returns:
+            beta: (N, C) backward log-probabilities.
+        """
+        device, dtype = S.device, S.dtype
+        beta = torch.full((N, C), NEG_INF.item(), device=device, dtype=dtype)
+
+        # Base case: last anchor, feasible positions N-1 to C-1
+        min_last = N - 1
+        max_last = C - 1
+        beta[N - 1, min_last : max_last + 1] = 0.0
+
+        # Backward pass
+        for i in range(N - 2, -1, -1):
+            # combine[q] = S[i+1, q] + beta[i+1, q]
+            combine = S[i + 1] + beta[i + 1]  # (C,)
+
+            # beta[i, p] = logsumexp_q (combine[q] + T[p, q])
+            # T[p, q] = 0 if p < q (valid: next position q > current p)
+            # So this computes logsumexp_{q > p} combine[q]
+            beta_expanded = combine.unsqueeze(0) + T  # (C, C): [p, q]
+            beta_new = torch.logsumexp(beta_expanded, dim=1)  # (C,)
+
+            # Explicit feasibility masking
+            min_pos = i
+            max_pos = C - N + i
+            feasible = torch.zeros(C, dtype=torch.bool, device=device)
+            feasible[min_pos : max_pos + 1] = True
+            beta[i] = torch.where(feasible, beta_new, NEG_INF)
+
+        return beta
+
+    def _margin_crf_loss(self, pred_scores_subset, gt_classes_subset):
+        """
+        Margin CRF loss with explicit forward-backward.
+
+        Computes L = max(0, (log_Z - score_GT) / N - margin) with analytical gradients
+        from forward-backward marginals instead of autograd through the forward chain.
+
+        Args:
+            pred_scores_subset: Raw logits (n_teeth, 32).
+            gt_classes_subset: GT class indices (n_teeth,).
+
+        Returns:
+            Margin CRF loss scalar.
+        """
+        device = pred_scores_subset.device
+        logits = pred_scores_subset.float()
+        C = 32
+        N = logits.shape[0]
+
+        # Sort by GT spatial position
+        pos_lookup = self.crf_full_position_lookup.to(device)
+        spatial_to_class = self.spatial_to_class_full.to(device)
+        gt_spatial = pos_lookup[gt_classes_subset].long()
+        sort_idx = gt_spatial.argsort()
+        sorted_logits = logits[sort_idx]
+        gt_sp_sorted = gt_spatial[sort_idx]
+
+        # Temperature-scaled log-softmax emissions
+        S = F.log_softmax(sorted_logits / self.crf_temperature, dim=-1)[:, spatial_to_class]
+
+        # Edge case: N >= C (all 32 teeth present, only 1 valid path)
+        if N >= C:
+            return torch.tensor(0.0, device=device, dtype=logits.dtype)
+
+        NEG_INF = torch.tensor(-1e9, device=device, dtype=logits.dtype)
+        T = self.crf_transition.to(device=device, dtype=logits.dtype)
+
+        # === Forward algorithm (compute alpha table and log_Z) ===
+        alpha_table = torch.full((N, C), NEG_INF.item(), device=device, dtype=logits.dtype)
+        alpha_table[0, : C - N + 1] = S[0, : C - N + 1]
+
+        for i in range(1, N):
+            alpha_expanded = alpha_table[i - 1].unsqueeze(1) + T  # (C, C)
+            alpha_new = torch.logsumexp(alpha_expanded, dim=0) + S[i]  # (C,)
+            min_pos, max_pos = i, C - N + i
+            feasible = torch.zeros(C, dtype=torch.bool, device=device)
+            feasible[min_pos : max_pos + 1] = True
+            alpha_table[i] = torch.where(feasible, alpha_new, NEG_INF)
+
+        log_Z = torch.logsumexp(alpha_table[N - 1], dim=0)
+
+        # === Backward algorithm (compute beta) ===
+        beta_table = self._crf_backward(S, N, C, T, NEG_INF)
+
+        # === Marginals ===
+        log_marginals = alpha_table + beta_table - log_Z  # (N, C)
+        marginals = log_marginals.exp().detach()
+
+        # === GT score ===
+        gt_score = S[torch.arange(N, device=device), gt_sp_sorted].sum()
+        raw_loss = (-gt_score + log_Z) / N
+
+        # === Margin CRF loss with custom gradient ===
+        loss = _MarginCRFFunction.apply(S, gt_sp_sorted, marginals, raw_loss.detach(), self.crf_margin)
         return loss
 
     def _neighbor_loss_fast(self, pred_classes: torch.Tensor, bboxes: torch.Tensor, k: int = 2) -> torch.Tensor:
