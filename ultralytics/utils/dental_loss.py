@@ -1363,9 +1363,8 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
             # Compute loss based on anatomy_loss_type
             if self.anatomy_loss_type == "ordered":
-                # Margin CRF: multi-competitor ordering loss with forward-backward
-                # Zero gradient when GT path dominates by margin (no persistent gradient)
-                anatomy_loss_value = self._crf_spatial_loss(
+                # Pairwise ordering loss: penalizes P(violation) between adjacent anchors
+                anatomy_loss_value = self._pairwise_ordering_loss(
                     pred_scores_subset, gt_classes_subset
                 )
                 total_loss = total_loss + anatomy_loss_value
