@@ -104,10 +104,14 @@ dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 anatomy: 0.0 # (float) anatomical constraint loss gain (dental segment tasks); 0.5 suggested when enabled
-duplicate_loss_type: soft # (str) duplicate loss type: "soft" (recommended) or "pairwise"
+duplicate_loss_type: hungarian # (str) duplicate loss type: "hungarian" (recommended, 1:1 matching) or "soft" or "pairwise"
+anatomy_loss_type: ordered # (str) anatomy loss type: "ordered" (margin CRF), "components", "soft_dp", "pairwise", or "hungarian"
+oph_lambda: 8.0 # (float) Order-Penalized Hungarian lambda; 0=pure Hungarian, 8.0=~30% ordering bias
 anatomy_schedule: rebalance # (str) anatomy loss schedule: "rebalance" (recommended), "sigmoid", "linear", or "constant"
 anatomy_sigmoid_midpoint: 0.7 # (float) sigmoid schedule: fraction of training where weight reaches 50% (0.0-1.0)
 anatomy_sigmoid_steepness: 0.1 # (float) sigmoid schedule: sharpness of S-curve (0.01-0.5, lower=sharper)
+crf_temperature: 5.0 # (float) CRF temperature for margin CRF spatial loss (anatomy_loss_type=ordered)
+crf_margin: 0.05 # (float) margin for margin CRF loss; loss=0 when GT path dominates by this amount
 boundary: 0.0 # (float) boundary loss gain (dental segment tasks); 1.0 to enable with rebalance schedule
 boundary_alpha_start: 0.01 # (float) initial alpha for boundary loss rebalance schedule
 boundary_alpha_increment: 0.01 # (float) alpha increase per epoch for boundary loss schedule

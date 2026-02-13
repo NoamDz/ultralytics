@@ -507,6 +507,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         self.crf_temperature = getattr(self.hyp, "crf_temperature", 5.0)
         self.crf_margin = getattr(self.hyp, "crf_margin", 0.05)
 
+        # Order-Penalized Hungarian (OPH) lambda parameter
+        # Controls ordering bias strength in Hungarian cost matrix.
+        # At lambda=8 with /32 normalization, ordering is ~30% of classification
+        # strength for a trained model, naturally stronger early in training.
+        # Set oph_lambda=0 to disable (pure Hungarian).
+        self.oph_lambda = getattr(self.hyp, "oph_lambda", 8.0)
+
         # CRF spatial loss constants (precomputed once)
         self._build_crf_constants()
 
@@ -1380,7 +1387,8 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 # Duplicate loss: enforces unique class predictions
                 if self.duplicate_loss_type == "hungarian":
                     # DETR-style bipartite matching (Carion et al., ECCV 2020)
-                    dup_loss = self._duplicate_loss_hungarian(pred_scores_subset)
+                    # Pass gt_classes for OPH ordering bias (uses oph_lambda > 0)
+                    dup_loss = self._duplicate_loss_hungarian(pred_scores_subset, gt_classes_subset)
                 elif self.duplicate_loss_type == "pairwise":
                     # Pairwise contrastive loss
                     dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
@@ -1531,42 +1539,35 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         return loss
 
-    def _duplicate_loss_hungarian(self, pred_scores_subset: torch.Tensor) -> torch.Tensor:
+    def _duplicate_loss_hungarian(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
-        Hungarian (bipartite matching) duplicate loss.
+        Order-Penalized Hungarian (OPH) duplicate loss.
 
         Uses the Hungarian algorithm to find optimal 1:1 assignment of detections
-        to classes based on predicted probabilities, then penalizes detections for
-        not being confident about their assigned class.
+        to classes, with an optional spatial ordering bias in the cost matrix.
 
-        Inspired by DETR (Carion et al., "End-to-End Object Detection with
-        Transformers", ECCV 2020), which uses bipartite matching to ensure unique
-        predictions. We adapt this for class-level duplicate prevention.
+        When oph_lambda > 0 and gt_classes is provided, the cost matrix becomes:
+            C[i,j] = -prob[i,j] + oph_lambda * |spatial_pos(j) - gt_spatial(i)| / 32
 
-        Algorithm:
-            1. Build cost matrix: C[i,j] = -prob[detection_i, class_j]
-            2. Find optimal assignment using Hungarian algorithm (scipy)
-            3. Compute cross-entropy loss on assigned (detection, class) pairs
+        This makes spatially implausible assignments more expensive, biasing the
+        matching toward order-consistent assignments when classification confidence
+        is low, while respecting confident predictions that may violate ordering.
 
-        Key properties:
-            - Optimal: Finds globally optimal unique assignment
-            - Explicit targets: Each detection gets a specific class to predict
-            - Direct gradient: Clear signal to increase prob for assigned class
+        Inspired by DETR (Carion et al., ECCV 2020) for bipartite matching and
+        Scott & Nowak (IEEE TIP 2006) for order-preserving assignment.
 
         Args:
             pred_scores_subset: Raw logits for representative anchors,
                                 shape (n_teeth, num_classes).
+            gt_classes: GT class indices for each anchor, shape (n_teeth,).
+                        Required when oph_lambda > 0 for ordering bias.
 
         Returns:
             Differentiable duplicate loss scalar.
-
-        Note:
-            The matching step is non-differentiable (uses detached probabilities),
-            but the loss computation uses the original tensor for gradient flow.
-
-        References:
-            Carion, N., et al. (2020). "End-to-End Object Detection with
-            Transformers." ECCV 2020.
         """
         n_teeth = pred_scores_subset.shape[0]
         n_classes = self.nc  # 32 for dental
@@ -1580,28 +1581,34 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # Step 1: Convert logits to probabilities
         probs = pred_scores_subset.softmax(dim=-1)  # (n_teeth, n_classes)
 
-        # Step 2: Build cost matrix (negative probability = lower cost for better match)
+        # Step 2: Build classification cost matrix
         # IMPORTANT: Detach to prevent gradients through the discrete matching step
-        # Use probabilities (not log-probs) for matching, as recommended in DETR paper
         cost_cls = -probs.detach().cpu().numpy()  # (n_teeth, n_classes)
 
+        # Step 2b: Add ordering bias if OPH is enabled
+        if self.oph_lambda > 0 and gt_classes is not None:
+            spatial_lookup = self.crf_full_position_lookup  # (32,) class -> spatial pos
+            gt_spatial = spatial_lookup[gt_classes.long()].cpu().numpy()  # (n_teeth,)
+            class_spatial = spatial_lookup.cpu().numpy()  # (32,)
+
+            # cost_ord[i,j] = |spatial_pos(class_j) - gt_spatial_pos(anchor_i)| / 32
+            cost_ord = np.abs(
+                class_spatial[np.newaxis, :] - gt_spatial[:, np.newaxis]
+            ) / 32.0  # (n_teeth, n_classes)
+
+            cost_cls = cost_cls + self.oph_lambda * cost_ord
+
         # Step 3: Pad to square matrix if needed
-        # Hungarian algorithm requires square matrix for optimal assignment
         if n_teeth < n_classes:
-            # More classes than detections: pad rows (dummy detections)
-            # Dummy rows have zero cost (unassigned classes = missing teeth, no penalty)
             padding = np.zeros((n_classes - n_teeth, n_classes))
             cost_matrix = np.vstack([cost_cls, padding])
         elif n_teeth > n_classes:
-            # More detections than classes: pad columns (extra "no class" slots)
-            # This shouldn't happen often in dental (max 32 teeth), but handle it
             padding = np.zeros((n_teeth, n_teeth - n_classes))
             cost_matrix = np.hstack([cost_cls, padding])
         else:
             cost_matrix = cost_cls
 
         # Step 4: Hungarian algorithm - find optimal 1:1 assignment
-        # Complexity: O(n³) where n = max(n_teeth, n_classes), fast for n≤32
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
         # Step 5: Filter to valid assignments only (exclude dummy rows/cols)
@@ -1609,7 +1616,6 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         det_indices = row_ind[valid_mask]
         class_indices = col_ind[valid_mask]
 
-        # Edge case: no valid assignments (shouldn't happen, but be safe)
         if len(det_indices) == 0:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
@@ -1618,11 +1624,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         class_indices_t = torch.tensor(class_indices, device=device, dtype=torch.long)
 
         # Step 7: Compute differentiable loss (cross-entropy on assigned pairs)
-        # Get probabilities for assigned (detection, class) pairs
         assigned_probs = probs[det_indices_t, class_indices_t]  # (n_matched,)
-
-        # Negative log-likelihood (cross-entropy)
-        # This is differentiable - gradients flow through probs back to logits
         loss = -torch.log(assigned_probs + 1e-8).mean()
 
         return loss
@@ -1633,20 +1635,11 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         gt_classes: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Structured hinge loss with DP-based ordered assignment and violation gating.
+        Ordered assignment loss using DP + cross-entropy.
 
         Finds the optimal monotonic class assignment via dynamic programming in
-        spatial-position space (0-31 whole mouth), then applies a margin-based hinge
-        loss only on anchors where the DP assignment disagrees with GT (violations).
-
-        Key improvements over previous DP + softmax CE:
-        1. Sorts by spatial position (not class index) — correct for Q1/Q4 reversal
-        2. Violation gating: zero loss when all assignments match GT (no gradient drag)
-        3. Structured hinge: only corrects violations with margin, vanishes when satisfied
-
-        The hinge loss for each violating anchor:
-            max(0, margin + logit[dp_class] - logit[gt_class])
-        pushes gt_class logit above dp_class logit by at least `margin`.
+        spatial-position space (0-31 whole mouth), then computes cross-entropy
+        loss between predictions and the DP assignment for all anchors.
 
         Args:
             pred_scores_subset: Raw logits for representative anchors,
@@ -1654,7 +1647,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             gt_classes: GT class indices for each anchor, shape (n_teeth,).
 
         Returns:
-            Differentiable structured hinge loss scalar.
+            Differentiable ordered assignment loss scalar.
         """
         n = pred_scores_subset.shape[0]
         device = pred_scores_subset.device
@@ -1667,7 +1660,6 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             return torch.tensor(0.0, device=device, dtype=dtype)
 
         # --- Step 1: Sort anchors by GT spatial position (not class index!) ---
-        # This fixes the Q1/Q4 reversal bug where class index != spatial order
         spatial_lookup = self.crf_full_position_lookup.to(device)
         s2c = self.spatial_to_class_full.to(device)
 
@@ -1676,18 +1668,15 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         ordered_preds = pred_scores_subset[sort_idx]  # (n, 32) logits in spatial order
 
         # --- Step 2: DP in spatial-position space ---
-        # Remap logits so index = spatial position: emission[i, pos] = logit[i, s2c[pos]]
         emissions = ordered_preds[:, s2c].float()  # (n, C) float32 for DP stability
 
         NEG_INF = -1e9
         V = torch.full((n, C), NEG_INF, device=device, dtype=torch.float32)
         backptr = torch.zeros((n, C), device=device, dtype=torch.long)
 
-        # Base case: first anchor can use positions [0, C-n]
         max_first = C - n
         V[0, : max_first + 1] = emissions[0, : max_first + 1]
 
-        # Fill DP table
         for i in range(1, n):
             remaining = n - 1 - i
             max_pos_i = C - 1 - remaining
@@ -1697,7 +1686,6 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             running_idx = 0
 
             for p in range(C):
-                # cummax_val_p = max of V[i-1, 0..p-1] (strict: previous pos < current)
                 cummax_val_p = running_max
                 cummax_idx_p = running_idx
 
@@ -1734,20 +1722,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         inverse_sort = sort_idx.argsort()
         dp_classes = dp_classes_sorted[inverse_sort]
 
-        # --- Step 4: Violation gating ---
-        # If DP assignment matches GT for all anchors, ordering is already satisfied
-        violations = dp_classes != gt_classes
-        if not violations.any():
-            return torch.tensor(0.0, device=device, dtype=dtype)
-
-        # --- Step 5: Structured hinge loss on violating anchors ---
-        arange = torch.arange(n, device=device)
-        gt_logits = pred_scores_subset[arange, gt_classes.long()]
-        dp_logits = pred_scores_subset[arange, dp_classes.long()]
-
-        # hinge = max(0, margin + dp_logit - gt_logit) for violations only
-        hinge = torch.clamp(self.dp_margin + dp_logits - gt_logits, min=0.0)
-        loss = hinge[violations].mean()
+        # --- Step 4: Cross-entropy loss against DP assignment ---
+        probs = pred_scores_subset.softmax(dim=-1)
+        assigned_probs = probs[torch.arange(n, device=device), dp_classes]
+        loss = -torch.log(assigned_probs + 1e-8).mean()
 
         return loss
 
