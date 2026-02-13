@@ -107,10 +107,10 @@ anatomy: 0.0 # (float) anatomical constraint loss gain (dental segment tasks); 0
 duplicate_loss_type: hungarian # (str) duplicate loss type: "hungarian" (recommended, 1:1 matching) or "soft" or "pairwise"
 anatomy_loss_type: components # (str) anatomy loss type: "components" (Hungarian+neighbor, recommended) or "ordered" (pairwise ordering only)
 oph_lambda: 0.0 # (float) Order-Penalized Hungarian lambda; 0=pure Hungarian, 8.0=~30% ordering bias
-violation_weight: 0.5 # (float) violation ordering loss weight; 0=disabled, 0.5 recommended
+violation_weight: 0.05 # (float) violation ordering loss weight; 0=disabled, 0.05 gives ~equal magnitude to Hungarian late
 violation_start_epoch: 20 # (int) epoch to begin ramping violation loss (0=from start)
 violation_ramp_epochs: 10 # (int) epochs over which to linearly ramp violation loss to full weight
-violation_margin: 1.0 # (float) minimum spatial gap required between consecutive anchors
+violation_margin: 0.5 # (float) minimum spatial gap between consecutive anchors (0-31 scale)
 violation_tau: 3.0 # (float) softmax temperature for soft spatial positions
 anatomy_schedule: rebalance # (str) anatomy loss schedule: "rebalance" (recommended), "sigmoid", "linear", or "constant"
 anatomy_sigmoid_midpoint: 0.7 # (float) sigmoid schedule: fraction of training where weight reaches 50% (0.0-1.0)

@@ -517,10 +517,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # Violation ordering loss: penalizes consecutive anchor pairs whose predicted
         # soft spatial positions violate GT ordering. Separate from Hungarian (additive),
         # gated to activate after epoch K with linear ramp.
-        self.violation_weight = getattr(self.hyp, "violation_weight", 0.5)
+        self.violation_weight = getattr(self.hyp, "violation_weight", 0.05)
         self.violation_start_epoch = getattr(self.hyp, "violation_start_epoch", 20)
         self.violation_ramp_epochs = getattr(self.hyp, "violation_ramp_epochs", 10)
-        self.violation_margin = getattr(self.hyp, "violation_margin", 1.0)
+        self.violation_margin = getattr(self.hyp, "violation_margin", 0.5)
         self.violation_tau = getattr(self.hyp, "violation_tau", 3.0)
 
         # CRF spatial loss constants (precomputed once)
