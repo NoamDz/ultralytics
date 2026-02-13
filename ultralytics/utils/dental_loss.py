@@ -512,7 +512,16 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # At lambda=8 with /32 normalization, ordering is ~30% of classification
         # strength for a trained model, naturally stronger early in training.
         # Set oph_lambda=0 to disable (pure Hungarian).
-        self.oph_lambda = getattr(self.hyp, "oph_lambda", 8.0)
+        self.oph_lambda = getattr(self.hyp, "oph_lambda", 0.0)
+
+        # Violation ordering loss: penalizes consecutive anchor pairs whose predicted
+        # soft spatial positions violate GT ordering. Separate from Hungarian (additive),
+        # gated to activate after epoch K with linear ramp.
+        self.violation_weight = getattr(self.hyp, "violation_weight", 0.5)
+        self.violation_start_epoch = getattr(self.hyp, "violation_start_epoch", 20)
+        self.violation_ramp_epochs = getattr(self.hyp, "violation_ramp_epochs", 10)
+        self.violation_margin = getattr(self.hyp, "violation_margin", 1.0)
+        self.violation_tau = getattr(self.hyp, "violation_tau", 3.0)
 
         # CRF spatial loss constants (precomputed once)
         self._build_crf_constants()
@@ -1410,8 +1419,15 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                     # Uses joint probability of invalid neighbor pairs
                     neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
 
-                # Ordering loss (currently disabled - uses hard class assignments)
-                ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
+                # Violation ordering loss: penalizes soft spatial position inversions
+                # Gated to activate after violation_start_epoch with linear ramp
+                viol_w = self._get_violation_weight()
+                if viol_w > 0:
+                    ordering_loss = viol_w * self._violation_ordering_loss(
+                        pred_scores_subset, gt_classes_subset
+                    )
+                else:
+                    ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
                 # Apply three-phase weight multiplier to neighbor loss
                 # This implements late-stage focus: suppressed early, full force late
@@ -1628,6 +1644,70 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         loss = -torch.log(assigned_probs + 1e-8).mean()
 
         return loss
+
+    def _violation_ordering_loss(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Violation ordering loss: penalizes consecutive anchors whose predicted
+        soft spatial positions violate GT spatial ordering.
+
+        Computes a differentiable "expected spatial position" per anchor via
+        softmax-weighted sum over spatial positions, then applies a hinge loss
+        on consecutive pairs sorted by GT spatial position.
+
+        Args:
+            pred_scores_subset: Raw logits, shape (n_teeth, num_classes).
+            gt_classes: GT class indices per anchor, shape (n_teeth,).
+
+        Returns:
+            Scalar violation loss (0 if all pairs are correctly ordered).
+        """
+        n_teeth = pred_scores_subset.shape[0]
+        device = pred_scores_subset.device
+        dtype = pred_scores_subset.dtype
+
+        if n_teeth < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        # Spatial position lookup: class index -> full-mouth position (0-31)
+        spatial_lookup = self.crf_full_position_lookup.to(device)  # (32,)
+
+        # Step 1: Sort anchors by GT spatial position
+        gt_spatial = spatial_lookup[gt_classes.long()]  # (n_teeth,)
+        sort_idx = gt_spatial.argsort()  # ascending spatial order
+
+        # Step 2: Compute soft spatial position for each anchor
+        # soft_pos(i) = sum_c softmax(logits_i / tau)[c] * spatial_position[c]
+        probs = torch.softmax(pred_scores_subset.float() / self.violation_tau, dim=-1)
+        soft_pos = (probs * spatial_lookup.unsqueeze(0)).sum(dim=-1)  # (n_teeth,)
+
+        # Step 3: Get soft positions in GT-sorted order
+        sorted_soft_pos = soft_pos[sort_idx]  # (n_teeth,)
+
+        # Step 4: Hinge loss on consecutive pairs
+        # For each pair (i, i+1): loss = max(0, soft_pos[i] - soft_pos[i+1] + margin)
+        # Violation = predicted position of earlier tooth >= predicted position of later tooth
+        diffs = sorted_soft_pos[:-1] - sorted_soft_pos[1:]  # (n_teeth-1,)
+        violations = torch.relu(diffs + self.violation_margin)  # (n_teeth-1,)
+
+        return violations.mean()
+
+    def _get_violation_weight(self) -> float:
+        """Get current violation loss weight based on epoch gating schedule."""
+        if self.violation_weight <= 0:
+            return 0.0
+        epoch = self.current_epoch
+        start = self.violation_start_epoch
+        ramp = self.violation_ramp_epochs
+        if epoch < start:
+            return 0.0
+        if ramp <= 0 or epoch >= start + ramp:
+            return self.violation_weight
+        # Linear ramp from 0 to violation_weight over ramp epochs
+        return self.violation_weight * (epoch - start) / ramp
 
     def _ordered_assignment_loss(
         self,
