@@ -106,7 +106,7 @@ kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 anatomy: 0.0 # (float) anatomical constraint loss gain (dental segment tasks); 0.5 suggested when enabled
 duplicate_loss_type: hungarian # (str) duplicate loss type: "hungarian" or "hungarian_violation_gated" or "hungarian_order_margin" or "soft" or "pairwise"
 anatomy_loss_type: components # (str) anatomy loss type: "components" (Hungarian+neighbor, recommended) or "ordered" (pairwise ordering only)
-oph_lambda: 0.03 # (float) Order-Penalized Hungarian lambda; 0=pure Hungarian, 0.03=calibrated ordering bias
+oph_lambda: 0.0 # (float) Order-Penalized Hungarian lambda; 0=pure Hungarian, 0.03=calibrated ordering bias
 oph_start_epoch: 50 # (int) epoch to begin OPH ordering bias (0=from start, 50=late-stage)
 oph_ramp_epochs: 10 # (int) epochs to linearly ramp OPH lambda from 0 to full (0=instant)
 oph_use_log_cost: True # (bool) use -log(prob) classification cost in OPH (better calibrated than -prob)
