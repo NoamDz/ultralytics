@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -376,6 +377,14 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # - "hungarian": DETR-style bipartite matching for optimal 1:1 assignment (DEFAULT)
         #                Explicit unique targets, strongest gradient signal
         #                Reference: Carion et al., ECCV 2020
+        # - "hungarian_violation_gated": OPH cost term only on anchors currently
+        #                                involved in ordering/duplicate violations.
+        #                                Order term magnitude is scaled to be a
+        #                                light fraction of classification cost.
+        # - "hungarian_order_margin": Hungarian CE + violation-gated ordered-competitor
+        #                             margin (HOCM). Preserves Hungarian strengths while
+        #                             adding targeted ordering pressure only on unordered
+        #                             assignments.
         self.duplicate_loss_type = getattr(self.hyp, "duplicate_loss_type", "hungarian")
 
         # Anatomy loss type options:
@@ -509,10 +518,33 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         # Order-Penalized Hungarian (OPH) lambda parameter
         # Controls ordering bias strength in Hungarian cost matrix.
-        # At lambda=8 with /32 normalization, ordering is ~30% of classification
-        # strength for a trained model, naturally stronger early in training.
+        # With -prob cost: lambda=0.03 gives ~3% ordering bias at trained logit scales.
+        # With -log(prob) cost: lambda=0.03 gives calibrated bias relative to NLL scale.
         # Set oph_lambda=0 to disable (pure Hungarian).
         self.oph_lambda = getattr(self.hyp, "oph_lambda", 0.0)
+        self.oph_start_epoch = getattr(self.hyp, "oph_start_epoch", 0)
+        self.oph_ramp_epochs = getattr(self.hyp, "oph_ramp_epochs", 0)
+        self.oph_use_log_cost = getattr(self.hyp, "oph_use_log_cost", False)
+
+        # Violation-gated OPH settings (duplicate_loss_type="hungarian_violation_gated")
+        # Penalty is:
+        #   cost_ord = vgoph_lambda * mean(cost_cls_row) * normalized_distance
+        # so order signal is capped to a small fraction (vgoph_lambda) of cls cost scale.
+        self.vgoph_lambda = getattr(self.hyp, "vgoph_lambda", 0.08)
+        self.vgoph_use_log_cost = getattr(self.hyp, "vgoph_use_log_cost", True)
+        self.vgoph_include_duplicate_gate = getattr(self.hyp, "vgoph_include_duplicate_gate", True)
+
+        # Hungarian Ordered-Competitor Margin (HOCM) settings.
+        # Active only when duplicate_loss_type == "hungarian_order_margin".
+        self.hocm_beta = getattr(self.hyp, "hocm_beta", 0.5)
+        self.hocm_margin = getattr(self.hyp, "hocm_margin", 0.05)
+        self.hocm_use_oph_base = getattr(self.hyp, "hocm_use_oph_base", False)
+        self.hocm_oph_lambda = getattr(self.hyp, "hocm_oph_lambda", 0.0)
+        self.hocm_use_log_cost = getattr(self.hyp, "hocm_use_log_cost", True)
+        self.hocm_severity_power = getattr(self.hyp, "hocm_severity_power", 0.0)
+
+        # Neighbor loss weight multiplier (0 to disable, 1.0 = default)
+        self.neighbor_weight = getattr(self.hyp, "neighbor_weight", 1.0)
 
         # Violation ordering loss: penalizes consecutive anchor pairs whose predicted
         # soft spatial positions violate GT ordering. Separate from Hungarian (additive),
@@ -1398,6 +1430,13 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                     # DETR-style bipartite matching (Carion et al., ECCV 2020)
                     # Pass gt_classes for OPH ordering bias (uses oph_lambda > 0)
                     dup_loss = self._duplicate_loss_hungarian(pred_scores_subset, gt_classes_subset)
+                elif self.duplicate_loss_type == "hungarian_violation_gated":
+                    # Apply OPH ordering penalty only to anchors participating
+                    # in current ordering/duplicate violations.
+                    dup_loss = self._duplicate_loss_hungarian_violation_gated(pred_scores_subset, gt_classes_subset)
+                elif self.duplicate_loss_type == "hungarian_order_margin":
+                    # HOCM: keep Hungarian CE, add margin only when assignment is unordered
+                    dup_loss = self._duplicate_loss_hungarian_order_margin(pred_scores_subset, gt_classes_subset)
                 elif self.duplicate_loss_type == "pairwise":
                     # Pairwise contrastive loss
                     dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
@@ -1409,15 +1448,28 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                     dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
                 # Neighbor loss: choose between GT-conditioned and soft (original)
-                if self.neighbor_gt_conditioned:
-                    # GT-conditioned: uses GT neighbor class (found to hurt performance)
-                    neighbor_loss = self._neighbor_loss_gt_conditioned(
-                        pred_scores_subset, bboxes, gt_classes_subset
-                    )
+                if self.neighbor_weight > 0:
+                    if self.neighbor_gt_conditioned:
+                        # GT-conditioned: uses GT neighbor class (found to hurt performance)
+                        neighbor_loss = self._neighbor_loss_gt_conditioned(
+                            pred_scores_subset, bboxes, gt_classes_subset
+                        )
+                    else:
+                        # Soft neighbor loss (original implementation)
+                        # Uses joint probability of invalid neighbor pairs
+                        neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
+
+                    # Apply three-phase weight multiplier to neighbor loss
+                    neighbor_multiplier = self._get_neighbor_multiplier()
+
+                    # Log raw loss before multiplier (for monitoring)
+                    if self._neighbor_log_enabled:
+                        self._neighbor_log["raw_loss_sum"] += neighbor_loss.detach().item()
+                        self._neighbor_log["count"] += 1
+
+                    neighbor_loss = neighbor_loss * neighbor_multiplier * self.neighbor_weight
                 else:
-                    # Soft neighbor loss (original implementation)
-                    # Uses joint probability of invalid neighbor pairs
-                    neighbor_loss = self._neighbor_loss_soft_legacy(pred_scores_subset, bboxes)
+                    neighbor_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
                 # Violation ordering loss: penalizes soft spatial position inversions
                 # Gated to activate after violation_start_epoch with linear ramp
@@ -1429,20 +1481,6 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 else:
                     ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
-                # Apply three-phase weight multiplier to neighbor loss
-                # This implements late-stage focus: suppressed early, full force late
-                neighbor_multiplier = self._get_neighbor_multiplier()
-
-                # Log raw loss before multiplier (for monitoring)
-                if self._neighbor_log_enabled:
-                    self._neighbor_log["raw_loss_sum"] += neighbor_loss.detach().item()
-                    self._neighbor_log["count"] += 1
-
-                neighbor_loss = neighbor_loss * neighbor_multiplier
-
-                # Note: sqrt normalization removed for margin loss since _neighbor_loss_margin
-                # already returns mean() over all pairs (proper normalization).
-                # Legacy losses (dup_loss, ordering_loss) would need sqrt normalization if re-enabled.
                 total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss)
             valid_count = valid_count + 1.0
 
@@ -1555,6 +1593,93 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         return loss
 
+    def _hungarian_assign_classes(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes: torch.Tensor = None,
+        oph_lambda: Optional[float] = None,
+        use_log_prob_cost: bool = False,
+        violation_gate: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute Hungarian assignment classes for each detection.
+
+        Args:
+            pred_scores_subset: Raw logits, shape (n_teeth, num_classes).
+            gt_classes: Optional GT classes for order-biased costs.
+            oph_lambda: Optional override for ordering-bias lambda.
+            use_log_prob_cost: If True, uses -log(prob) cost. Else uses -prob.
+            violation_gate: Optional (n_teeth,) binary/float mask. If provided,
+                            ordering penalty is applied only where gate>0.
+
+        Returns:
+            assigned_classes: (n_teeth,) class index assigned to each detection.
+            probs: Softmax probabilities (n_teeth, num_classes).
+        """
+        n_teeth = pred_scores_subset.shape[0]
+        n_classes = self.nc
+        device = pred_scores_subset.device
+
+        probs = pred_scores_subset.softmax(dim=-1)  # (n_teeth, n_classes)
+
+        if use_log_prob_cost:
+            cost_cls = -torch.log(probs.detach().clamp_min(1e-8)).cpu().numpy()
+        else:
+            cost_cls = -probs.detach().cpu().numpy()
+        cost_cls = np.nan_to_num(cost_cls, nan=50.0, posinf=50.0, neginf=0.0)
+
+        lambda_eff = self.oph_lambda if oph_lambda is None else oph_lambda
+        if lambda_eff > 0 and gt_classes is not None:
+            spatial_lookup = self.crf_full_position_lookup.to(device=device)
+            gt_spatial = spatial_lookup[gt_classes.long()].detach().cpu().numpy()  # (n_teeth,)
+            class_spatial = spatial_lookup.detach().cpu().numpy()  # (n_classes,)
+
+            # cost_ord[i,j] = normalized spatial distance between class_j and anchor_i GT position
+            cost_ord = np.abs(class_spatial[np.newaxis, :] - gt_spatial[:, np.newaxis]) / 32.0
+            if violation_gate is not None:
+                # Keep order term lightweight and scale-aware:
+                # penalty <= lambda_eff * mean(classification cost row)
+                # when normalized distance <= 1.
+                gate_np = violation_gate.detach().float().clamp(0, 1).cpu().numpy().reshape(-1, 1)
+                row_scale = cost_cls.mean(axis=1, keepdims=True).clip(min=1e-6)
+                cost_ord = float(lambda_eff) * row_scale * cost_ord * gate_np
+                cost_ord = np.nan_to_num(cost_ord, nan=0.0, posinf=0.0, neginf=0.0)
+                cost_cls = cost_cls + cost_ord
+            else:
+                cost_cls = cost_cls + float(lambda_eff) * cost_ord
+            cost_cls = np.nan_to_num(cost_cls, nan=50.0, posinf=50.0, neginf=0.0)
+
+        # Hungarian expects square matrix
+        if n_teeth < n_classes:
+            padding = np.zeros((n_classes - n_teeth, n_classes))
+            cost_matrix = np.vstack([cost_cls, padding])
+        elif n_teeth > n_classes:
+            padding = np.zeros((n_teeth, n_teeth - n_classes))
+            cost_matrix = np.hstack([cost_cls, padding])
+        else:
+            cost_matrix = cost_cls
+        cost_matrix = np.nan_to_num(cost_matrix, nan=50.0, posinf=50.0, neginf=0.0)
+
+        try:
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        except ValueError:
+            fallback = probs.argmax(dim=-1)
+            return fallback, probs
+        valid_mask = (row_ind < n_teeth) & (col_ind < n_classes)
+
+        assigned_classes = torch.full((n_teeth,), -1, device=device, dtype=torch.long)
+        if valid_mask.any():
+            det_indices = torch.tensor(row_ind[valid_mask], device=device, dtype=torch.long)
+            class_indices = torch.tensor(col_ind[valid_mask], device=device, dtype=torch.long)
+            assigned_classes[det_indices] = class_indices
+
+        # Safety fallback for unmatched detections (rare in this setting)
+        if (assigned_classes < 0).any():
+            fallback = probs.argmax(dim=-1)
+            assigned_classes = torch.where(assigned_classes >= 0, assigned_classes, fallback)
+
+        return assigned_classes, probs
+
     def _duplicate_loss_hungarian(
         self,
         pred_scores_subset: torch.Tensor,
@@ -1586,64 +1711,247 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             Differentiable duplicate loss scalar.
         """
         n_teeth = pred_scores_subset.shape[0]
-        n_classes = self.nc  # 32 for dental
-        device = pred_scores_subset.device
         dtype = pred_scores_subset.dtype
 
         # Edge case: no teeth or single tooth
         if n_teeth < 2:
-            return torch.tensor(0.0, device=device, dtype=dtype)
+            return torch.tensor(0.0, device=pred_scores_subset.device, dtype=dtype)
 
-        # Step 1: Convert logits to probabilities
-        probs = pred_scores_subset.softmax(dim=-1)  # (n_teeth, n_classes)
-
-        # Step 2: Build classification cost matrix
-        # IMPORTANT: Detach to prevent gradients through the discrete matching step
-        cost_cls = -probs.detach().cpu().numpy()  # (n_teeth, n_classes)
-
-        # Step 2b: Add ordering bias if OPH is enabled
-        if self.oph_lambda > 0 and gt_classes is not None:
-            spatial_lookup = self.crf_full_position_lookup  # (32,) class -> spatial pos
-            gt_spatial = spatial_lookup[gt_classes.long()].cpu().numpy()  # (n_teeth,)
-            class_spatial = spatial_lookup.cpu().numpy()  # (32,)
-
-            # cost_ord[i,j] = |spatial_pos(class_j) - gt_spatial_pos(anchor_i)| / 32
-            cost_ord = np.abs(
-                class_spatial[np.newaxis, :] - gt_spatial[:, np.newaxis]
-            ) / 32.0  # (n_teeth, n_classes)
-
-            cost_cls = cost_cls + self.oph_lambda * cost_ord
-
-        # Step 3: Pad to square matrix if needed
-        if n_teeth < n_classes:
-            padding = np.zeros((n_classes - n_teeth, n_classes))
-            cost_matrix = np.vstack([cost_cls, padding])
-        elif n_teeth > n_classes:
-            padding = np.zeros((n_teeth, n_teeth - n_classes))
-            cost_matrix = np.hstack([cost_cls, padding])
-        else:
-            cost_matrix = cost_cls
-
-        # Step 4: Hungarian algorithm - find optimal 1:1 assignment
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-        # Step 5: Filter to valid assignments only (exclude dummy rows/cols)
-        valid_mask = (row_ind < n_teeth) & (col_ind < n_classes)
-        det_indices = row_ind[valid_mask]
-        class_indices = col_ind[valid_mask]
-
-        if len(det_indices) == 0:
-            return torch.tensor(0.0, device=device, dtype=dtype)
-
-        # Step 6: Convert to tensors for differentiable loss computation
-        det_indices_t = torch.tensor(det_indices, device=device, dtype=torch.long)
-        class_indices_t = torch.tensor(class_indices, device=device, dtype=torch.long)
-
-        # Step 7: Compute differentiable loss (cross-entropy on assigned pairs)
-        assigned_probs = probs[det_indices_t, class_indices_t]  # (n_matched,)
+        assigned_classes, probs = self._hungarian_assign_classes(
+            pred_scores_subset,
+            gt_classes=gt_classes,
+            oph_lambda=self._get_oph_lambda(),
+            use_log_prob_cost=self.oph_use_log_cost,
+        )
+        det_indices = torch.arange(n_teeth, device=pred_scores_subset.device)
+        assigned_probs = probs[det_indices, assigned_classes]
         loss = -torch.log(assigned_probs + 1e-8).mean()
 
         return loss
+
+    def _vgoph_violation_gate(self, pred_scores_subset: torch.Tensor, gt_classes: torch.Tensor) -> torch.Tensor:
+        """
+        Build per-anchor binary gate for violation-gated OPH.
+
+        Gate=1 for anchors participating in:
+        1) Adjacent ordering inversions in GT-sorted anchor order.
+        2) Duplicate predicted classes (optional).
+        """
+        n = pred_scores_subset.shape[0]
+        device = pred_scores_subset.device
+        if n < 2:
+            return torch.zeros(n, device=device, dtype=torch.float32)
+
+        spatial_lookup = self.crf_full_position_lookup.to(device)
+        pred_classes = pred_scores_subset.detach().argmax(dim=-1)
+
+        # Adjacent inversion detection in GT-sorted anchor order
+        gt_spatial = spatial_lookup[gt_classes.long()]
+        sort_idx = gt_spatial.argsort()
+        pred_spatial_sorted = spatial_lookup[pred_classes.long()][sort_idx]
+        pair_viol = pred_spatial_sorted[:-1] >= pred_spatial_sorted[1:]
+
+        gate_sorted = torch.zeros(n, device=device, dtype=torch.bool)
+        if pair_viol.any():
+            v_idx = pair_viol.nonzero(as_tuple=False).squeeze(1)
+            gate_sorted[v_idx] = True
+            gate_sorted[v_idx + 1] = True
+
+        gate = torch.zeros(n, device=device, dtype=torch.bool)
+        gate[sort_idx] = gate_sorted
+
+        if self.vgoph_include_duplicate_gate:
+            uniq, counts = pred_classes.unique(return_counts=True)
+            dup_classes = uniq[counts > 1]
+            if dup_classes.numel() > 0:
+                dup_mask = torch.isin(pred_classes, dup_classes)
+                gate = gate | dup_mask
+
+        return gate.float()
+
+    def _duplicate_loss_hungarian_violation_gated(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Violation-gated OPH duplicate loss.
+
+        Uses Hungarian CE as base objective. Adds OPH cost bias only for anchors
+        currently involved in ordering/duplicate violations. Order term is scaled
+        to remain a weak signal relative to classification cost.
+        """
+        n_teeth = pred_scores_subset.shape[0]
+        dtype = pred_scores_subset.dtype
+        device = pred_scores_subset.device
+
+        if n_teeth < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        gate = self._vgoph_violation_gate(pred_scores_subset, gt_classes)
+
+        assigned_classes, probs = self._hungarian_assign_classes(
+            pred_scores_subset,
+            gt_classes=gt_classes,
+            oph_lambda=self.vgoph_lambda,
+            use_log_prob_cost=self.vgoph_use_log_cost,
+            violation_gate=gate,
+        )
+
+        det_indices = torch.arange(n_teeth, device=device)
+        assigned_probs = probs[det_indices, assigned_classes]
+        loss = -torch.log(assigned_probs + 1e-8).mean()
+
+        return loss
+
+    def _ordered_dp_assignment_classes(self, pred_scores_subset: torch.Tensor, gt_classes: torch.Tensor) -> torch.Tensor:
+        """
+        Compute best ordered class assignment via DP and return assigned class indices.
+
+        Args:
+            pred_scores_subset: Raw logits, shape (n_teeth, num_classes).
+            gt_classes: GT class indices, shape (n_teeth,).
+
+        Returns:
+            (n_teeth,) class assignment enforcing strict monotonic order in spatial space.
+        """
+        n = pred_scores_subset.shape[0]
+        device = pred_scores_subset.device
+        C = 32
+
+        if n < 2:
+            return pred_scores_subset.argmax(dim=-1)
+        if n > C:
+            return pred_scores_subset.argmax(dim=-1)
+
+        spatial_lookup = self.crf_full_position_lookup.to(device)
+        s2c = self.spatial_to_class_full.to(device)
+
+        gt_spatial = spatial_lookup[gt_classes.long()]
+        sort_idx = gt_spatial.argsort()
+        ordered_preds = pred_scores_subset[sort_idx]
+
+        # Use log-probability emissions so path scores are comparable across anchors.
+        emissions = F.log_softmax(ordered_preds.float(), dim=-1)[:, s2c]
+
+        NEG_INF = -1e9
+        V = torch.full((n, C), NEG_INF, device=device, dtype=torch.float32)
+        backptr = torch.zeros((n, C), device=device, dtype=torch.long)
+
+        max_first = C - n
+        V[0, : max_first + 1] = emissions[0, : max_first + 1]
+
+        for i in range(1, n):
+            remaining = n - 1 - i
+            max_pos_i = C - 1 - remaining
+
+            prev_row = V[i - 1]
+            running_max = NEG_INF
+            running_idx = 0
+
+            for p in range(C):
+                cummax_val_p = running_max
+                cummax_idx_p = running_idx
+
+                if prev_row[p].item() > running_max:
+                    running_max = prev_row[p].item()
+                    running_idx = p
+
+                if 1 <= p <= max_pos_i:
+                    V[i, p] = cummax_val_p + emissions[i, p]
+                    backptr[i, p] = cummax_idx_p
+
+        min_final = n - 1
+        valid_final = V[n - 1, min_final:]
+        if valid_final.numel() > 0 and valid_final.max() > NEG_INF:
+            best_final = min_final + valid_final.argmax()
+        else:
+            best_final = V[n - 1].argmax()
+
+        assignment_pos = torch.zeros(n, device=device, dtype=torch.long)
+        assignment_pos[n - 1] = best_final
+
+        current = best_final.item()
+        for i in range(n - 2, -1, -1):
+            prev = backptr[i + 1, current].item()
+            assignment_pos[i] = prev
+            current = prev
+
+        ordered_classes = s2c[assignment_pos]
+        inverse_sort = sort_idx.argsort()
+        return ordered_classes[inverse_sort]
+
+    def _ordering_violation_ratio(self, assigned_classes: torch.Tensor, gt_classes: torch.Tensor) -> torch.Tensor:
+        """Return fraction of adjacent-order violations in GT-sorted anchor order."""
+        n = assigned_classes.shape[0]
+        device = assigned_classes.device
+        if n < 2:
+            return torch.tensor(0.0, device=device, dtype=torch.float32)
+
+        spatial_lookup = self.crf_full_position_lookup.to(device)
+        gt_spatial = spatial_lookup[gt_classes.long()]
+        sort_idx = gt_spatial.argsort()
+
+        assigned_spatial = spatial_lookup[assigned_classes.long()][sort_idx]
+        violations = (assigned_spatial[:-1] >= assigned_spatial[1:]).float()
+        return violations.mean()
+
+    def _duplicate_loss_hungarian_order_margin(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Hungarian Ordered-Competitor Margin (HOCM) loss.
+
+        Keeps Hungarian CE as the base objective and adds ordering pressure only when
+        Hungarian's assignment is unordered. The margin compares the score of the
+        Hungarian assignment to the score of the best ordered DP assignment.
+
+        Args:
+            pred_scores_subset: Raw logits for representative anchors, shape (n_teeth, num_classes).
+            gt_classes: GT class indices for each anchor, shape (n_teeth,).
+
+        Returns:
+            Scalar duplicate loss with optional ordered-competitor margin.
+        """
+        n = pred_scores_subset.shape[0]
+        device = pred_scores_subset.device
+        dtype = pred_scores_subset.dtype
+
+        if n < 2:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        oph_lambda = self.hocm_oph_lambda if self.hocm_use_oph_base else 0.0
+        assigned_h, probs = self._hungarian_assign_classes(
+            pred_scores_subset,
+            gt_classes=gt_classes if oph_lambda > 0 else None,
+            oph_lambda=oph_lambda,
+            use_log_prob_cost=self.hocm_use_log_cost,
+        )
+
+        idx = torch.arange(n, device=device)
+        base_loss = -torch.log(probs[idx, assigned_h] + 1e-8).mean()
+
+        if self.hocm_beta <= 0:
+            return base_loss
+
+        violation_ratio = self._ordering_violation_ratio(assigned_h, gt_classes)
+        if violation_ratio.item() <= 0:
+            return base_loss
+
+        assigned_o = self._ordered_dp_assignment_classes(pred_scores_subset.detach(), gt_classes)
+
+        # Compare mean log-probability per anchor for scale compatibility with CE mean.
+        log_probs = F.log_softmax(pred_scores_subset.float(), dim=-1)
+        score_h = log_probs[idx, assigned_h].mean()
+        score_o = log_probs[idx, assigned_o].mean()
+        margin_loss = F.relu(self.hocm_margin + score_h - score_o)
+
+        if self.hocm_severity_power > 0:
+            margin_loss = margin_loss * violation_ratio.pow(self.hocm_severity_power)
+
+        return base_loss + self.hocm_beta * margin_loss.to(dtype)
 
     def _violation_ordering_loss(
         self,
@@ -1708,6 +2016,25 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             return self.violation_weight
         # Linear ramp from 0 to violation_weight over ramp epochs
         return self.violation_weight * (epoch - start) / ramp
+
+    def _get_oph_lambda(self) -> float:
+        """Get current OPH lambda based on epoch gating schedule.
+
+        Returns 0.0 before oph_start_epoch, linearly ramps over oph_ramp_epochs,
+        then returns full oph_lambda. When oph_start_epoch=0 and oph_ramp_epochs=0,
+        returns oph_lambda from the start (backwards compatible).
+        """
+        if self.oph_lambda <= 0:
+            return 0.0
+        epoch = self.current_epoch
+        start = self.oph_start_epoch
+        ramp = self.oph_ramp_epochs
+        if epoch < start:
+            return 0.0
+        if ramp <= 0 or epoch >= start + ramp:
+            return self.oph_lambda
+        # Linear ramp from 0 to oph_lambda over ramp epochs
+        return self.oph_lambda * (epoch - start) / ramp
 
     def _ordered_assignment_loss(
         self,
