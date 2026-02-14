@@ -103,17 +103,17 @@ cls: 0.5 # (float) classification loss gain
 dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
-anatomy: 0.0 # (float) anatomical constraint loss gain (dental segment tasks); 0.5 suggested when enabled
+anatomy: 2.0 # (float) anatomical constraint loss gain (dental segment tasks); 2.0 recommended with Hungarian
 duplicate_loss_type: hungarian # (str) duplicate loss type: "hungarian" or "hungarian_violation_gated" or "hungarian_order_margin" or "soft" or "pairwise"
 anatomy_loss_type: components # (str) anatomy loss type: "components" (Hungarian+neighbor, recommended) or "ordered" (pairwise ordering only)
 oph_lambda: 0.0 # (float) Order-Penalized Hungarian lambda; 0=pure Hungarian, 0.03=calibrated ordering bias
 oph_start_epoch: 50 # (int) epoch to begin OPH ordering bias (0=from start, 50=late-stage)
 oph_ramp_epochs: 10 # (int) epochs to linearly ramp OPH lambda from 0 to full (0=instant)
-oph_use_log_cost: True # (bool) use -log(prob) classification cost in OPH (better calibrated than -prob)
+oph_use_log_cost: False # (bool) use -log(prob) classification cost in OPH; False=-prob (matches original Hungarian)
 vgoph_lambda: 0.08 # (float) Violation-gated OPH strength; applied as a small fraction of cls-cost scale (recommended <=0.10)
 vgoph_use_log_cost: True # (bool) use -log(prob) classification cost in violation-gated OPH
 vgoph_include_duplicate_gate: True # (bool) include duplicate-prediction anchors in violation gate
-neighbor_weight: 0.0 # (float) neighbor loss weight multiplier; 0=disabled, 1.0=default
+neighbor_weight: 1.0 # (float) neighbor loss weight multiplier; 0=disabled, 1.0=default (original Hungarian had this ON)
 violation_weight: 0.0 # (float) violation ordering loss weight; 0=disabled, 0.05 gives ~equal magnitude to Hungarian late
 violation_start_epoch: 20 # (int) epoch to begin ramping violation loss (0=from start)
 violation_ramp_epochs: 10 # (int) epochs over which to linearly ramp violation loss to full weight
