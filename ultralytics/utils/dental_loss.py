@@ -1416,6 +1416,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                     pred_scores_subset, gt_classes_subset
                 )
                 total_loss = total_loss + anatomy_loss_value
+            elif self.anatomy_loss_type == "dp_ordered":
+                # Pure DP ordered assignment: monotonic argmax via dynamic programming + CE
+                anatomy_loss_value = self._ordered_assignment_loss(
+                    pred_scores_subset, gt_classes_subset
+                )
+                total_loss = total_loss + anatomy_loss_value
 
             # Distance Regularization (DR) Loss - independent, can be combined with any anatomy loss
             # Enforces smooth inter-tooth spacing via Laplacian regularization
@@ -1423,7 +1429,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 dr_loss = self._distance_regularization_loss(bboxes, gt_classes_subset)
                 total_loss = total_loss + self.dr_weight * dr_loss
 
-            if self.anatomy_loss_type != "ordered":
+            if self.anatomy_loss_type not in ("ordered", "dp_ordered"):
                 # Components mode (default): separate duplicate + neighbor losses
                 # Duplicate loss: enforces unique class predictions
                 if self.duplicate_loss_type == "hungarian":
