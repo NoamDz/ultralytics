@@ -104,7 +104,13 @@ dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 anatomy: 2.0 # (float) anatomical constraint loss gain (dental segment tasks); 2.0 recommended with Hungarian
-duplicate_loss_type: hungarian # (str) duplicate loss type: "hungarian" or "hungarian_violation_gated" or "hungarian_order_margin" or "soft" or "pairwise"
+duplicate_loss_type: hungarian_order_margin # (str) duplicate loss type: "hungarian" or "hungarian_violation_gated" or "hungarian_order_margin" or "soft" or "pairwise"
+hocm_beta: 0.5 # (float) HOCM margin loss weight; 0=pure Hungarian, >0 adds DP ordering margin
+hocm_margin: 0.05 # (float) HOCM hinge margin between Hungarian and DP scores
+hocm_use_oph_base: False # (bool) use OPH ordering bias in HOCM's base Hungarian
+hocm_oph_lambda: 0.0 # (float) OPH lambda for HOCM base Hungarian (only if hocm_use_oph_base=True)
+hocm_use_log_cost: True # (bool) use -log(prob) classification cost in HOCM Hungarian
+hocm_severity_power: 0.0 # (float) scale margin loss by violation_ratio^power; 0=no scaling
 anatomy_loss_type: components # (str) anatomy loss type: "components" (Hungarian+neighbor, recommended) or "ordered" (pairwise ordering only)
 oph_lambda: 0.0 # (float) Order-Penalized Hungarian lambda; 0=pure Hungarian, 0.03=calibrated ordering bias
 oph_start_epoch: 50 # (int) epoch to begin OPH ordering bias (0=from start, 50=late-stage)
