@@ -117,6 +117,7 @@ vgoph_lambda: 0.08 # (float) Violation-gated OPH strength
 vgoph_use_log_cost: True # (bool) use -log(prob) classification cost in violation-gated OPH
 vgoph_include_duplicate_gate: True # (bool) include duplicate-prediction anchors in violation gate
 neighbor_weight: 1.0 # (float) neighbor loss weight multiplier; 0=disabled, 1.0=default
+absent_weight: 0.0 # (float) absent-site (c_j=0) penalty weight; penalizes confident mass on edentulous FDI classes; 0=disabled. Effective scale = anatomy * absent_weight
 violation_weight: 0.0 # (float) violation ordering loss weight; 0=disabled
 violation_start_epoch: 20 # (int) epoch to begin ramping violation loss
 violation_ramp_epochs: 10 # (int) epochs over which to linearly ramp violation loss to full weight

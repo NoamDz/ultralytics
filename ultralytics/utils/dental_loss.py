@@ -546,6 +546,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # Neighbor loss weight multiplier (0 to disable, 1.0 = default)
         self.neighbor_weight = getattr(self.hyp, "neighbor_weight", 1.0)
 
+        # Absent-site (c_j=0) penalty weight (0 to disable). Penalizes confident
+        # probability mass placed on FDI classes with ZERO ground-truth teeth in the
+        # image ("fabricated" tooth at an edentulous site). Applied inside the anatomy
+        # loss, so its effective scale is anatomy_weight * absent_weight.
+        self.absent_weight = getattr(self.hyp, "absent_weight", 0.0)
+
         # Violation ordering loss: penalizes consecutive anchor pairs whose predicted
         # soft spatial positions violate GT ordering. Separate from Hungarian (additive),
         # gated to activate after epoch K with linear ramp.
@@ -1505,7 +1511,17 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 self._neighbor_log["raw_loss_sum"] = 0.0
                 self._neighbor_log["count"] = 0
 
-        return total_loss / torch.clamp(valid_count, min=1.0)
+        anatomy = total_loss / torch.clamp(valid_count, min=1.0)
+        if getattr(self, "absent_weight", 0.0) > 0:
+            # Absent-site (c_j=0) penalty: punish confident mass on FDI classes with
+            # zero GT teeth in the image. The representative-anchor set above is
+            # GT-derived and cannot see these background fabrications, so this term
+            # operates over ALL anchors. Because it is part of loss[4] it is additionally
+            # scaled by anatomy_weight downstream (effective scale = anatomy_weight * absent_weight).
+            anatomy = anatomy + self.absent_weight * self._absent_site_loss(
+                pred_scores, target_scores, fg_mask
+            )
+        return anatomy
 
     def _duplicate_loss_fast(self, pred_classes: torch.Tensor) -> torch.Tensor:
         """Penalize duplicate class predictions - fast version (hard counting)."""
@@ -1542,6 +1558,72 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         soft_dup_loss = F.relu(class_prob_sums - 1.0).sum()
 
         return soft_dup_loss
+
+    def _absent_site_loss(
+        self,
+        pred_scores: torch.Tensor,
+        target_scores: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Penalize confident probability mass on absent (c_j=0) FDI classes.
+
+        An "absent site" is an FDI class with ZERO ground-truth teeth in the image.
+        Confident probability placed there corresponds to a fabricated tooth at an
+        edentulous site. Unlike the duplicate/neighbor terms (which operate over
+        GT-derived representative anchors), this term sweeps ALL anchors so it can
+        see fabrications that live in background anchors.
+
+        For each image i:
+            p     = softmax(pred_scores[i])                  -> (A, num_classes)
+            gate  = p.max(-1).detach()                       -> (A,)  peak confidence (no grad)
+            q     = (gate[:, None] * p).sum(0)               -> (num_classes,) soft count
+            loss  = (q * absent_mask).sum()                  -> relu(q - 0) = q since q >= 0
+
+        The confidence gate is detached so gradients reach the classification head
+        only through p (i.e. through the absent-class logits), never through the gate.
+
+        Args:
+            pred_scores: Full all-anchor logits, shape (B, A, num_classes).
+            target_scores: Soft labels, shape (B, A, num_classes); argmax over a
+                foreground anchor gives that anchor's assigned GT FDI class.
+            fg_mask: Foreground anchor mask, shape (B, A) bool.
+
+        Returns:
+            Differentiable scalar averaged over images that have >=1 foreground anchor.
+        """
+        batch_size = pred_scores.shape[0]
+        device = pred_scores.device
+        total_loss = torch.tensor(0.0, device=device)
+        valid_count = torch.tensor(0.0, device=device)
+
+        for i in range(batch_size):
+            fg_idx = fg_mask[i].nonzero(as_tuple=False).squeeze(1)
+            if fg_idx.numel() == 0:
+                # No assigned teeth: no notion of present/absent for this image.
+                continue
+
+            # Per-anchor class probabilities over ALL anchors
+            p = pred_scores[i].softmax(dim=-1)  # (A, num_classes)
+
+            # Peak confidence gate, detached so gradient flows only through p
+            gate = p.max(dim=-1).values.detach()  # (A,)
+
+            # Present FDI classes are the GT classes assigned to foreground anchors
+            present = target_scores[i, fg_idx].argmax(dim=-1).unique()  # (n_present,)
+
+            # absent_mask: 1.0 for absent classes, 0.0 for present classes
+            absent_mask = torch.ones(self.nc, device=device)  # (num_classes,)
+            absent_mask[present] = 0.0
+
+            # Confidence-weighted soft count per class over ALL anchors
+            q = (gate.unsqueeze(1) * p).sum(dim=0)  # (num_classes,)
+
+            # c_j=0 -> relu(q - 0) = q (q >= 0); zero out present classes
+            total_loss = total_loss + (q * absent_mask).sum()
+            valid_count = valid_count + 1.0
+
+        return total_loss / torch.clamp(valid_count, min=1.0)
 
     def _duplicate_loss_pairwise(self, pred_scores_subset: torch.Tensor) -> torch.Tensor:
         """
