@@ -116,7 +116,8 @@ oph_use_log_cost: False # (bool) use -log(prob) classification cost in OPH; Fals
 vgoph_lambda: 0.08 # (float) Violation-gated OPH strength
 vgoph_use_log_cost: True # (bool) use -log(prob) classification cost in violation-gated OPH
 vgoph_include_duplicate_gate: True # (bool) include duplicate-prediction anchors in violation gate
-neighbor_weight: 1.0 # (float) neighbor loss weight multiplier; 0=disabled, 1.0=default
+neighbor_weight: 0.0 # (float) neighbor loss weight multiplier; 0=disabled. PURE SOFT-DUP: kept 0 (was 1.0 on dental_loss) so the anatomy term is ONLY _duplicate_loss_soft
+ordinal_alpha: 0.0 # (float) ordinal cls-loss weight; 0=standard BCE (matches baseline). >0 swaps BCE for distance-weighted cls loss. Kept 0 so dental arm differs from baseline ONLY by the soft-dup term
 violation_weight: 0.0 # (float) violation ordering loss weight; 0=disabled
 violation_start_epoch: 20 # (int) epoch to begin ramping violation loss
 violation_ramp_epochs: 10 # (int) epochs over which to linearly ramp violation loss to full weight
