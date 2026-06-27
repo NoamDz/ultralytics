@@ -121,6 +121,8 @@ absent_weight: 0.0 # (float) absent-site (c_j=0) penalty weight; penalizes confi
 coverage_weight: 0.0 # (float) coverage (cardinality bonus) weight; drives the soft count of PRESENT FDI numbers up toward 1 (mirror of soft-dup); 0=disabled. Effective scale = anatomy * coverage_weight
 coverage_start_epoch: 10 # (int) epoch to begin ramping coverage loss
 coverage_ramp_epochs: 10 # (int) epochs over which to linearly ramp coverage loss to full weight
+coverage_gt_anchored: False # (bool) Fix-d: GT-anchored ambiguity-gated coverage (push each tooth's OWN GT-class prob up on ambiguous teeth) instead of summed-count coverage; False=summed-count
+coverage_margin: 0.5 # (float) Fix-d ambiguity gate: apply coverage only where the top1-top2 softmax margin is below this
 violation_weight: 0.0 # (float) violation ordering loss weight; 0=disabled
 violation_start_epoch: 20 # (int) epoch to begin ramping violation loss
 violation_ramp_epochs: 10 # (int) epochs over which to linearly ramp violation loss to full weight

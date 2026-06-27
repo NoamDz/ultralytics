@@ -561,6 +561,16 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         self.coverage_weight = getattr(self.hyp, "coverage_weight", 0.0)
         self.coverage_start_epoch = getattr(self.hyp, "coverage_start_epoch", 10)
         self.coverage_ramp_epochs = getattr(self.hyp, "coverage_ramp_epochs", 10)
+        # Fix-d (GT-anchored, ambiguity-gated coverage). The default summed-count
+        # coverage (relu(1 - q_j) over present numbers) is permutation-blind: it
+        # knows a number is under-claimed but not which tooth owns it, so it sprays
+        # the number onto neighbours. Fix-d instead pushes each tooth's OWN GT-class
+        # probability p[i, g_i] up toward 1 (recall/mislabel-safe by construction),
+        # and ONLY on ambiguous teeth (top1-top2 softmax margin < coverage_margin),
+        # i.e. the near-tied posterior molars where residual mislabels live.
+        # Off (False) => unchanged summed-count coverage; coverage_weight=0 => no-op.
+        self.coverage_gt_anchored = bool(getattr(self.hyp, "coverage_gt_anchored", False))
+        self.coverage_margin = getattr(self.hyp, "coverage_margin", 0.5)
 
         # Violation ordering loss: penalizes consecutive anchor pairs whose predicted
         # soft spatial positions violate GT ordering. Separate from Hungarian (additive),
@@ -1583,8 +1593,20 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             and gt_classes_subset is not None
             and gt_classes_subset.numel() > 0
         ):
-            present = gt_classes_subset.unique()
-            coverage_loss = F.relu(1.0 - class_prob_sums[present]).sum()
+            if getattr(self, "coverage_gt_anchored", False):
+                # Fix-d: per-tooth GT-anchored deficit, gated to ambiguous teeth.
+                # p_own = prob each rep-anchor places on its OWN GT class. Raising it
+                # pulls a tooth toward its own number (cannot lower other teeth's
+                # correct numbers, so recall/mislabel-safe by construction).
+                p_own = pred_probs.gather(1, gt_classes_subset.view(-1, 1)).squeeze(1)
+                # Ambiguity gate (no grad through the hard mask): act only where the
+                # top1-top2 softmax margin is below coverage_margin.
+                top2 = pred_probs.topk(2, dim=-1).values  # (n_teeth, 2)
+                gate = (top2[:, 0] - top2[:, 1] < self.coverage_margin).float()
+                coverage_loss = (F.relu(1.0 - p_own) * gate).sum()
+            else:
+                present = gt_classes_subset.unique()
+                coverage_loss = F.relu(1.0 - class_prob_sums[present]).sum()
             soft_dup_loss = soft_dup_loss + coverage_weight * coverage_loss
 
         return soft_dup_loss
