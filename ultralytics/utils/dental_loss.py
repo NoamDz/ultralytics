@@ -552,6 +552,16 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # loss, so its effective scale is anatomy_weight * absent_weight.
         self.absent_weight = getattr(self.hyp, "absent_weight", 0.0)
 
+        # Coverage (cardinality bonus) term — the mirror of the soft-duplicate
+        # penalty. Drives the soft count q_j of PRESENT FDI numbers UP toward 1
+        # (penalize relu(1 - q_j) for classes that ARE in the GT), added inside
+        # _duplicate_loss_soft. Default 0.0 => exact no-op for every other config.
+        # Effective scale = anatomy_weight * coverage_weight. Gated like violation:
+        # off before start_epoch, linear ramp over ramp_epochs, then hold.
+        self.coverage_weight = getattr(self.hyp, "coverage_weight", 0.0)
+        self.coverage_start_epoch = getattr(self.hyp, "coverage_start_epoch", 10)
+        self.coverage_ramp_epochs = getattr(self.hyp, "coverage_ramp_epochs", 10)
+
         # Violation ordering loss: penalizes consecutive anchor pairs whose predicted
         # soft spatial positions violate GT ordering. Separate from Hungarian (additive),
         # gated to activate after epoch K with linear ramp.
@@ -1453,8 +1463,10 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                     # Pairwise contrastive loss
                     dup_loss = self._duplicate_loss_pairwise(pred_scores_subset)
                 elif self.duplicate_loss_type == "soft":
-                    # Sum-based soft loss
-                    dup_loss = self._duplicate_loss_soft(pred_scores_subset)
+                    # Sum-based soft loss (+ optional coverage bonus on present FDI numbers)
+                    dup_loss = self._duplicate_loss_soft(
+                        pred_scores_subset, gt_classes_subset, self._get_coverage_weight()
+                    )
                 else:
                     # Disabled (for ablation studies)
                     dup_loss = torch.tensor(0.0, device=pred_scores_subset.device)
@@ -1530,7 +1542,12 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         counts.scatter_add_(0, pred_classes, ones)
         return F.relu(counts - 1.0).sum()
 
-    def _duplicate_loss_soft(self, pred_scores_subset: torch.Tensor) -> torch.Tensor:
+    def _duplicate_loss_soft(
+        self,
+        pred_scores_subset: torch.Tensor,
+        gt_classes_subset: torch.Tensor = None,
+        coverage_weight: float = 0.0,
+    ) -> torch.Tensor:
         """
         Penalize duplicate class predictions using soft probabilistic counting.
 
@@ -1556,6 +1573,19 @@ class DentalSegmentationLoss(v8SegmentationLoss):
 
         # Penalize when sum > 1.0 (indicates duplicate predictions)
         soft_dup_loss = F.relu(class_prob_sums - 1.0).sum()
+
+        # Coverage (bonus) term: drive the soft count q_j of PRESENT FDI numbers
+        # UP toward 1 — the mirror of the duplicate penalty. Penalize relu(1 - q_j)
+        # ONLY for classes that appear in this image's GT. Off by default
+        # (coverage_weight=0.0) so every other config is byte-for-byte unchanged.
+        if (
+            coverage_weight > 0.0
+            and gt_classes_subset is not None
+            and gt_classes_subset.numel() > 0
+        ):
+            present = gt_classes_subset.unique()
+            coverage_loss = F.relu(1.0 - class_prob_sums[present]).sum()
+            soft_dup_loss = soft_dup_loss + coverage_weight * coverage_loss
 
         return soft_dup_loss
 
@@ -2104,6 +2134,25 @@ class DentalSegmentationLoss(v8SegmentationLoss):
             return self.violation_weight
         # Linear ramp from 0 to violation_weight over ramp epochs
         return self.violation_weight * (epoch - start) / ramp
+
+    def _get_coverage_weight(self) -> float:
+        """Coverage (bonus) loss weight on the epoch gating schedule.
+
+        Mirror of _get_violation_weight: 0 before coverage_start_epoch, linear
+        ramp over coverage_ramp_epochs, then hold at coverage_weight. Returns 0.0
+        when coverage_weight<=0, so every non-coverage config is unaffected.
+        """
+        if self.coverage_weight <= 0:
+            return 0.0
+        epoch = self.current_epoch
+        start = self.coverage_start_epoch
+        ramp = self.coverage_ramp_epochs
+        if epoch < start:
+            return 0.0
+        if ramp <= 0 or epoch >= start + ramp:
+            return self.coverage_weight
+        # Linear ramp from 0 to coverage_weight over ramp epochs
+        return self.coverage_weight * (epoch - start) / ramp
 
     def _get_oph_lambda(self) -> float:
         """Get current OPH lambda based on epoch gating schedule.
