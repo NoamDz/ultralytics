@@ -127,6 +127,14 @@ crf_margin: 0.05 # (float) margin for margin CRF loss
 boundary: 0.0 # (float) boundary loss gain (dental segment tasks); 1.0 to enable with rebalance schedule
 boundary_alpha_start: 0.01 # (float) initial alpha for boundary loss rebalance schedule
 boundary_alpha_increment: 0.01 # (float) alpha increase per epoch for boundary loss schedule
+ordinal_alpha: 0.3 # (float) ordinal cls-loss FDI-distance weighting; 0=plain BCE (exposes the previously hard-coded default)
+identity_loss_type: "off" # (str) identity attribution loss: "off", "column" (IoU-ownership), "column_nogeo" (TAL-diagonal control), "local" (per-anchor best-IoU CE scaffold). MUST stay quoted: bare off = YAML bool.
+identity_weight: 0.0 # (float) identity loss gain, decoupled from anatomy gain; 0=disabled
+identity_tau: 0.1 # (float) ownership softmax temperature over anchors (lower=crisper owner)
+identity_iou_floor: 0.5 # (float) min best-IoU for a GT column to participate (abstention gate)
+identity_pos_weight: 0.0 # (float) optional positive owner-CE stabilizer weight (BCE already covers it)
+identity_warmup_iters: 500 # (int) linear warmup in loss-forward calls (iteration-based; epoch counters freeze on detect runs)
+identity_p2_sharpen: False # (bool) multiply anti-intruder term by detached p (focal-style sharpening)
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction
