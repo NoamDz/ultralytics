@@ -98,6 +98,18 @@ def test_pairwise_iou_basic():
     assert torch.allclose(iou[0, 2], torch.tensor(0.5), atol=1e-6)
 
 
+def test_pairwise_iou_fp16_large_boxes_no_overflow():
+    """fp16 boxes >256px overflow area to inf without the float cast -> IoU degrades to 0.
+    With the cast, IoU is finite and correct (identical boxes -> 1.0)."""
+    from ultralytics.utils.dental_identity import pairwise_iou_xyxy
+
+    a = torch.tensor([[0.0, 0.0, 800.0, 800.0]], dtype=torch.float16)
+    b = torch.tensor([[0.0, 0.0, 800.0, 800.0]], dtype=torch.float16)
+    iou = pairwise_iou_xyxy(a, b)
+    assert torch.isfinite(iou).all(), iou
+    assert torch.allclose(iou[0, 0].float(), torch.tensor(1.0), atol=1e-3), iou
+
+
 def test_gradient_matches_closed_form():
     from ultralytics.utils.dental_identity import identity_loss
 

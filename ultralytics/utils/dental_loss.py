@@ -516,7 +516,14 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         # epochs freeze at 0 on detection runs.
         self._identity_step = 0
         self._identity_diag = {"batches": 0, "disagree_sum": 0.0, "gate_off_sum": 0.0, "count": 0}
-        self._identity_log_every = int(os.getenv("ULTRA_IDENTITY_LOG_EVERY", "200"))
+        self._identity_log_every = max(1, int(os.getenv("ULTRA_IDENTITY_LOG_EVERY", "200")))
+        if self._identity_active and anatomy_weight <= 0:
+            LOGGER.warning(
+                "identity_loss_type=%s with identity_weight=%s but anatomy gain is 0 — "
+                "the identity loss lives inside the anatomy path and will NOT run. "
+                "Set anatomy>0 to enable it.",
+                self.identity_loss_type, self.identity_weight,
+            )
 
         # Distance Regularization (DR) Loss (Chung et al., 2021)
         # Enforces smooth inter-tooth spacing via Laplacian regularization
@@ -1389,7 +1396,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         target_scores: torch.Tensor,
         target_gt_idx: torch.Tensor,
         fg_mask: torch.Tensor,
-        target_bboxes: torch.Tensor = None,
+        target_bboxes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute anatomical constraint loss - FULLY VECTORIZED.

@@ -28,6 +28,9 @@ __all__ = ["pairwise_iou_xyxy", "identity_loss"]
 
 def pairwise_iou_xyxy(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """Pairwise IoU between two xyxy box sets. Returns (len(boxes1), len(boxes2))."""
+    # fp16 (AMP) area products overflow to inf for boxes >~256px; compute in float32.
+    boxes1 = boxes1.float()
+    boxes2 = boxes2.float()
     area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
     area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
     lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
