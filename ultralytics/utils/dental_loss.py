@@ -29,6 +29,7 @@ from scipy.optimize import linear_sum_assignment
 
 from ultralytics.utils import LOGGER
 from ultralytics.utils.loss import v8DetectionLoss, v8SegmentationLoss
+from ultralytics.utils.dental_identity import identity_loss
 
 
 def compute_signed_distance_map_batch(masks: np.ndarray) -> np.ndarray:
@@ -499,6 +500,23 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         self.ordinal_alpha = getattr(self.hyp, "ordinal_alpha", 0.3)
         if self.ordinal_alpha > 0:
             self._build_distance_matrix()
+
+        # Identity-aware attribution loss (2026-07 campaign; spec 2026-07-05-odin-identity-aware-loss-design.md)
+        # NOTE: `or "off"` coerces YAML-bool False (bare `off` in yaml) back to the string sentinel.
+        self.identity_loss_type = getattr(self.hyp, "identity_loss_type", "off") or "off"
+        self.identity_weight = getattr(self.hyp, "identity_weight", 0.0)
+        self.identity_tau = getattr(self.hyp, "identity_tau", 0.1)
+        self.identity_iou_floor = getattr(self.hyp, "identity_iou_floor", 0.5)
+        self.identity_pos_weight = getattr(self.hyp, "identity_pos_weight", 0.0)
+        self.identity_warmup_iters = getattr(self.hyp, "identity_warmup_iters", 500)
+        self.identity_p2_sharpen = getattr(self.hyp, "identity_p2_sharpen", False)
+        self._identity_active = self.identity_loss_type != "off" and self.identity_weight > 0
+        # Iteration-based warmup counter (one increment per loss forward). NEVER use
+        # current_epoch here: set_epoch is only registered by SegmentationTrainer, so
+        # epochs freeze at 0 on detection runs.
+        self._identity_step = 0
+        self._identity_diag = {"batches": 0, "disagree_sum": 0.0, "gate_off_sum": 0.0, "count": 0}
+        self._identity_log_every = int(os.getenv("ULTRA_IDENTITY_LOG_EVERY", "200"))
 
         # Distance Regularization (DR) Loss (Chung et al., 2021)
         # Enforces smooth inter-tooth spacing via Laplacian regularization
@@ -1190,7 +1208,8 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                         torch.cuda.synchronize()
                     t_start = time.perf_counter()
                 loss[4] = self.compute_anatomy_loss_vectorized(
-                    pred_scores, pred_bboxes * stride_tensor, target_scores, target_gt_idx, fg_mask
+                    pred_scores, pred_bboxes * stride_tensor, target_scores, target_gt_idx, fg_mask,
+                    target_bboxes=target_bboxes,
                 )
                 if self._timing_enabled:
                     if self._timing_sync and pred_scores.is_cuda:
@@ -1370,6 +1389,7 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         target_scores: torch.Tensor,
         target_gt_idx: torch.Tensor,
         fg_mask: torch.Tensor,
+        target_bboxes: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Compute anatomical constraint loss - FULLY VECTORIZED.
@@ -1379,6 +1399,14 @@ class DentalSegmentationLoss(v8SegmentationLoss):
         batch_size = pred_scores.shape[0]
         total_loss = torch.tensor(0.0, device=pred_scores.device)
         valid_count = torch.tensor(0.0, device=pred_scores.device)
+
+        if self._identity_active:
+            if target_bboxes is None:
+                raise ValueError(
+                    "identity loss is active but target_bboxes was not passed to "
+                    "compute_anatomy_loss_vectorized — update the call site."
+                )
+            self._identity_step += 1  # iteration-based warmup (one per loss forward)
 
         for i in range(batch_size):
             fg_i = fg_mask[i]
@@ -1488,6 +1516,32 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                     ordering_loss = torch.tensor(0.0, device=pred_scores_subset.device)
 
                 total_loss = total_loss + (dup_loss + neighbor_loss + ordering_loss)
+
+            # Identity-aware attribution loss (additive to soft-dup; all modes).
+            if self._identity_active:
+                gt_boxes_subset = target_bboxes[i, rep_anchor]  # (n_teeth, 4) xyxy px (assigner output)
+                id_loss, id_diag = identity_loss(
+                    pred_scores_subset,
+                    bboxes,
+                    gt_boxes_subset,
+                    gt_classes_subset,
+                    mode=self.identity_loss_type,
+                    tau=self.identity_tau,
+                    iou_floor=self.identity_iou_floor,
+                    pos_weight=self.identity_pos_weight,
+                    p2_sharpen=self.identity_p2_sharpen,
+                )
+                ramp = min(1.0, self._identity_step / max(1, self.identity_warmup_iters))
+                # Decouple from the shared anatomy gain: the caller multiplies this
+                # method's return by anatomy_weight, so pre-divide to make the net
+                # factor exactly identity_weight * ramp. (anatomy_weight > 0 is
+                # guaranteed — this method only runs when the dental loss is active.)
+                anat_w = self._get_anatomy_weight()
+                total_loss = total_loss + (self.identity_weight * ramp / anat_w) * id_loss
+                if id_diag:
+                    self._identity_diag["disagree_sum"] += id_diag["tal_iou_disagree"]
+                    self._identity_diag["gate_off_sum"] += id_diag["gate_off_frac"]
+                    self._identity_diag["count"] += 1
             valid_count = valid_count + 1.0
 
         # Periodic logging of neighbor loss statistics
@@ -1504,6 +1558,18 @@ class DentalSegmentationLoss(v8SegmentationLoss):
                 )
                 self._neighbor_log["raw_loss_sum"] = 0.0
                 self._neighbor_log["count"] = 0
+
+        if self._identity_active:
+            self._identity_diag["batches"] += 1
+            if self._identity_diag["batches"] % self._identity_log_every == 0 and self._identity_diag["count"]:
+                d = self._identity_diag
+                LOGGER.info(
+                    f"Identity loss diag [step {self._identity_step}]: "
+                    f"tal_iou_disagree={d['disagree_sum'] / d['count']:.3f}, "
+                    f"gate_off={d['gate_off_sum'] / d['count']:.3f}, "
+                    f"ramp={min(1.0, self._identity_step / max(1, self.identity_warmup_iters)):.2f}"
+                )
+                d.update(disagree_sum=0.0, gate_off_sum=0.0, count=0)
 
         return total_loss / torch.clamp(valid_count, min=1.0)
 
@@ -3003,7 +3069,8 @@ class DentalDetectionLoss(DentalSegmentationLoss):
                         torch.cuda.synchronize()
                     t_start = time.perf_counter()
                 loss[3] = self.compute_anatomy_loss_vectorized(
-                    pred_scores, pred_bboxes * stride_tensor, target_scores, target_gt_idx, fg_mask
+                    pred_scores, pred_bboxes * stride_tensor, target_scores, target_gt_idx, fg_mask,
+                    target_bboxes=target_bboxes,
                 )
                 if self._timing_enabled:
                     if self._timing_sync and pred_scores.is_cuda:
